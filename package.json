@@ -1,0 +1,92 @@
+{
+  "name": "@muserank/webhook-sdk",
+  "version": "2.0.0",
+  "description": "SDK for receiving MuseRank webhook events in your application",
+  "packageManager": "bun@1.2.0",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    },
+    "./web": {
+      "types": "./dist/web.d.ts",
+      "import": "./dist/web.mjs",
+      "require": "./dist/web.js"
+    },
+    "./nextjs": {
+      "types": "./dist/nextjs.d.ts",
+      "import": "./dist/nextjs.mjs",
+      "require": "./dist/nextjs.js"
+    },
+    "./express": {
+      "types": "./dist/express.d.ts",
+      "import": "./dist/express.mjs",
+      "require": "./dist/express.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts src/web.ts src/nextjs.ts src/express.ts --format cjs,esm --dts --clean",
+    "dev": "tsup src/index.ts src/web.ts src/nextjs.ts src/express.ts --format cjs,esm --dts --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "npm run typecheck",
+    "test:run": "vitest --run",
+    "test": "vitest",
+    "check": "npm run typecheck && npm run test:run && npm run build",
+    "pack:check": "npm pack --dry-run --cache ./.npm-cache",
+    "prepublishOnly": "npm run check"
+  },
+  "keywords": [
+    "muserank",
+    "webhook",
+    "cms",
+    "content",
+    "seo",
+    "nextjs",
+    "express",
+    "remix",
+    "astro",
+    "sveltekit",
+    "cloudflare-workers"
+  ],
+  "author": "MuseRank",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/muserank/webhook-sdk"
+  },
+  "homepage": "https://muserank.com/docs/webhook-sdk",
+  "bugs": {
+    "url": "https://github.com/muserank/webhook-sdk/issues"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.3.1",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  },
+  "peerDependencies": {
+    "express": ">=4.0.0",
+    "next": ">=13.0.0"
+  },
+  "peerDependenciesMeta": {
+    "express": {
+      "optional": true
+    },
+    "next": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
