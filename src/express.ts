@@ -155,14 +155,14 @@ export function createMuseRankWebhook(config: WebhookConfig) {
 }
 
 interface RawBodyMiddlewareOptions {
-    maxBodySizeBytes?: number;
+  maxBodySizeBytes?: number;
 }
 
 type ExpressJsonVerify = (
-    req: ExpressRequest & { rawBody?: Buffer },
-    res: unknown,
-    buf: Buffer,
-    encoding: string
+  req: ExpressRequest & { rawBody?: Buffer },
+  res: unknown,
+  buf: Buffer,
+  encoding: string,
 ) => void;
 
 /**
@@ -191,23 +191,26 @@ type ExpressJsonVerify = (
  * );
  * ```
  */
-export function createRawBodyVerifier(options?: RawBodyMiddlewareOptions): ExpressJsonVerify {
-    const maxBodySizeBytes = options?.maxBodySizeBytes ?? DEFAULT_MAX_BODY_SIZE_BYTES;
+export function createRawBodyVerifier(
+  options?: RawBodyMiddlewareOptions,
+): ExpressJsonVerify {
+  const maxBodySizeBytes =
+    options?.maxBodySizeBytes ?? DEFAULT_MAX_BODY_SIZE_BYTES;
 
-    if (maxBodySizeBytes < 0) {
-        throw new Error("maxBodySizeBytes must be >= 0");
+  if (maxBodySizeBytes < 0) {
+    throw new Error("maxBodySizeBytes must be >= 0");
+  }
+
+  return (req, _res, buf) => {
+    if (maxBodySizeBytes > 0 && buf.length > maxBodySizeBytes) {
+      throw new WebhookVerificationError(
+        `Webhook payload too large (${buf.length} bytes). Max allowed is ${maxBodySizeBytes} bytes.`,
+        413,
+      );
     }
 
-    return (req, _res, buf) => {
-        if (maxBodySizeBytes > 0 && buf.length > maxBodySizeBytes) {
-            throw new WebhookVerificationError(
-                `Webhook payload too large (${buf.length} bytes). Max allowed is ${maxBodySizeBytes} bytes.`,
-                413
-            );
-        }
-
-        req.rawBody = Buffer.from(buf);
-    };
+    req.rawBody = Buffer.from(buf);
+  };
 }
 
 /**
