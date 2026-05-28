@@ -233,17 +233,22 @@ Each article in the webhook payload includes:
 
 ```typescript
 interface WebhookArticle {
-  id: string;              // Unique article ID
-  title: string;           // Article title
-  content_markdown: string; // Content in Markdown
-  content_html: string;     // Content in HTML
+  id: string;               // Unique article ID
+  title: string;            // SEO-optimized title (falls back to editorial title)
+  content_markdown: string; // Content as Markdown (converted from the editor's HTML)
+  content_html: string;     // Content as raw HTML (exactly as edited in MuseRank)
   meta_description: string; // SEO meta description
   created_at: string;       // ISO 8601 timestamp
-  image_url: string;        // Featured image URL
+  image_url: string;        // Featured image URL ("" when none set)
   slug: string;             // URL-friendly slug
-  tags: string[];           // Associated tags/keywords
+  tags: string[];           // [primary keyword, focus keyphrase, ...topical-map siblings]
 }
 ```
+
+> **Note**
+> `content_markdown` and `content_html` are both present in every payload — pick whichever fits your destination. Use `content_html` when writing to an HTML-native target (e.g. an `<article>` tag, a CMS rich-text field, an email template) and `content_markdown` when writing to a Markdown-native one (Contentful long-text, MDX, Ghost source).
+>
+> `tags` is derived from MuseRank's keyword pipeline (primary keyword + SEO focus keyphrase + the article's topical-map siblings), deduped case-insensitively. `tags[0]` is always the primary keyword.
 
 ## Security
 
@@ -262,7 +267,15 @@ createMuseRankWebhook({
 });
 ```
 
-The SDK will verify the `X-MuseRank-Signature` header using HMAC-SHA256.
+The SDK will verify the `X-MuseRank-Signature` header (format: `sha256=<lowercase hex>`) against an HMAC-SHA256 of the **raw** request body using your `signingSecret`. Signature comparison is constant-time.
+
+**How to get the signing secret:**
+
+1. Open **Integrations → Webhook** in your MuseRank dashboard.
+2. On first connect, MuseRank generates a `whsec_…` signing secret and shows it **once** — copy it immediately into your environment as `MUSERANK_SIGNING_SECRET`.
+3. To rotate (e.g. after a suspected leak), use the **Rotate** action on the same screen. The previous secret stops verifying immediately, so update your receiver before traffic resumes.
+
+If you set `signingSecret` on the SDK side but the destination has no secret configured in MuseRank, every request will fail with `401 Invalid signature`. Either generate one in the dashboard, or remove the `signingSecret` option from the SDK config until you do.
 
 ### Replay Attack Protection
 
