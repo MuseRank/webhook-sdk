@@ -61,11 +61,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/muserank/webhook-sdk"
+    "url": "git+https://github.com/MuseRank/webhook-sdk.git"
   },
-  "homepage": "https://muserank.com/docs/webhook-sdk",
+  "homepage": "https://github.com/MuseRank/webhook-sdk#readme",
   "bugs": {
-    "url": "https://github.com/muserank/webhook-sdk/issues"
+    "url": "https://github.com/MuseRank/webhook-sdk/issues"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

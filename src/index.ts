@@ -35,11 +35,26 @@ export type WebhookEventType =
 export interface WebhookArticle {
   /** Unique article ID */
   id: string;
-  /** Article title (may include SEO title) */
+  /**
+   * Article title as it should appear to readers and search engines.
+   * MuseRank prefers the SEO-optimized title (`seoTitle`) when set and
+   * falls back to the editorial title otherwise. Treat this as the
+   * authoritative public title.
+   */
   title: string;
-  /** Article content in Markdown format */
+  /**
+   * Article content rendered as Markdown.
+   * Produced by converting the editor's HTML through Turndown so it
+   * round-trips into Markdown-native targets (Contentful long-text,
+   * Ghost, MDX) without manual cleanup. May be `""` when the article
+   * has no content yet — always check before persisting.
+   */
   content_markdown: string;
-  /** Article content in HTML format */
+  /**
+   * Article content as raw HTML, exactly as edited in the MuseRank
+   * Tiptap editor. Use this when your destination is HTML-native
+   * (a CMS, an `<article>` tag, an Email Builder).
+   */
   content_html: string;
   /** Meta description for SEO */
   meta_description: string;
@@ -49,7 +64,13 @@ export interface WebhookArticle {
   image_url: string;
   /** URL-friendly slug */
   slug: string;
-  /** Associated tags/keywords */
+  /**
+   * Topical tags for the article. MuseRank derives these from the
+   * primary keyword, the SEO focus keyphrase, and any sibling
+   * keywords assigned to the article in the topical map. Order is
+   * stable: `tags[0]` is always the primary keyword. Duplicates are
+   * removed case-insensitively.
+   */
   tags: string[];
 }
 
