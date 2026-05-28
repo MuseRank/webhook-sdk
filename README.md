@@ -4,10 +4,13 @@ Official SDK for receiving MuseRank webhook events in your application. Easily i
 
 ## Features
 
-- 🔒 **Secure** - HMAC signature verification, constant-time token comparison, replay attack protection, payload size limits
-- 📦 **Universal** - Works with Next.js, Remix, Astro, SvelteKit, Express, Cloudflare Workers, Deno, Bun
-- 🎯 **Type-Safe** - Full TypeScript support with exported types
-- ⚡ **Simple** - One function setup, handles all verification automatically
+- **Idempotency built-in** — every event carries a stable `event_id`; use it as your `UNIQUE` constraint
+- **HMAC signing with zero-downtime rotation** — `signingSecret` accepts an array, every secret is tried in constant time
+- **Per-handler timeouts** — slow handlers are aborted via `AbortSignal` so MuseRank can back off and retry
+- **Structured error overrides** — `onError` can return a custom HTTP status to ack-and-drop poison messages instead of looping retries
+- **Universal** — Next.js, Remix, Astro, SvelteKit, Express, Cloudflare Workers, Deno, Bun
+- **Type-safe** — full TypeScript support, `payload.schema.json` shipped for non-TS consumers
+- **Secure** — constant-time token comparison, replay protection, payload size limits
 
 ## Installation
 
@@ -188,8 +191,10 @@ interface WebhookConfig {
   // Required: Your webhook token from MuseRank
   accessToken: string;
 
-  // Optional: Signing secret for HMAC verification (recommended for production)
-  signingSecret?: string;
+  // Optional: Signing secret for HMAC verification.
+  // Pass an array during a rotation window — the SDK tries every entry,
+  // so both old-and-new secrets verify until you drop the old one.
+  signingSecret?: string | readonly string[];
 
   // Optional: Timestamp tolerance for replay attack protection (default: 5 minutes)
   // Set to 0 to disable timestamp verification
@@ -199,18 +204,30 @@ interface WebhookConfig {
   // Set to 0 to disable size checks
   maxBodySizeBytes?: number;
 
-  // Event handlers
-  onArticlePublished?: (article, payload) => Promise<void> | void;
-  onArticleUpdated?: (article, payload) => Promise<void> | void;
-  onArticleScheduled?: (article, payload) => Promise<void> | void;
-  onArticleFailed?: (article, payload) => Promise<void> | void;
-  onTestPing?: (payload) => Promise<void> | void;
+  // Optional: Per-handler timeout in milliseconds (default: 30s).
+  // The handler's `context.signal` is aborted when this elapses.
+  // Set to 0 to disable.
+  handlerTimeoutMs?: number;
 
-  // Generic handler (called for all events)
-  onEvent?: (eventType, payload) => Promise<void> | void;
+  // Event handlers — third arg is a `WebhookContext`:
+  //   { eventId, deliveryId, signal }
+  onArticlePublished?: (article, payload, context) => Promise<void> | void;
+  onArticleUpdated?:   (article, payload, context) => Promise<void> | void;
+  onArticleScheduled?: (article, payload, context) => Promise<void> | void;
+  onArticleFailed?:    (article, payload, context) => Promise<void> | void;
+  onTestPing?:         (payload, context) => Promise<void> | void;
 
-  // Error handler
-  onError?: (error, payload) => Promise<void> | void;
+  // Generic handler (called after specific handlers)
+  onEvent?: (eventType, payload, context) => Promise<void> | void;
+
+  // Error handler. Return { statusCode, success?, message? } to override
+  // the default 500 — e.g. `{ statusCode: 200 }` to ack-and-drop poison
+  // messages, or `{ statusCode: 422 }` to permanently reject. Returning
+  // `void` keeps the default behavior.
+  onError?: (error, payload?) =>
+    | Promise<{ statusCode: number; success?: boolean; message?: string } | void>
+    | { statusCode: number; success?: boolean; message?: string }
+    | void;
 
   // Enable debug logging
   debug?: boolean;
@@ -250,6 +267,109 @@ interface WebhookArticle {
 >
 > `tags` is derived from MuseRank's keyword pipeline (primary keyword + SEO focus keyphrase + the article's topical-map siblings), deduped case-insensitively. `tags[0]` is always the primary keyword.
 
+## Envelope, idempotency, and retries
+
+Every payload also carries:
+
+```typescript
+interface WebhookPayload {
+  event_id: string;       // stable across retries — use as your idempotency key
+  delivery_id?: string;   // changes per attempt — use for log correlation only
+  event_type: WebhookEventType;
+  timestamp: string;      // ISO 8601, this delivery attempt
+  data: { articles: WebhookArticle[] };
+}
+```
+
+MuseRank retries failed deliveries (5xx and timeouts) up to 3 times with
+exponential backoff. The `event_id` stays the same on every retry, so the
+production-recommended pattern is:
+
+```typescript
+onArticlePublished: async (article, _payload, ctx) => {
+  // Race-safe atomic claim. If another worker already processed this
+  // event, the INSERT does nothing and we ack-and-drop.
+  const { rowCount } = await db.query(
+    `INSERT INTO processed_webhook_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING`,
+    [ctx.eventId],
+  );
+  if (rowCount === 0) return;
+
+  await db.article.upsert({ ... });
+}
+```
+
+A non-TypeScript consumer can validate payloads against the JSON Schema we
+ship at the package root:
+
+```bash
+node -e "console.log(require('@muserank/webhook-sdk/payload.schema.json').$id)"
+```
+
+The schema is regenerated against `WebhookPayload` on every CI run, so it
+never drifts.
+
+## Handler timeouts
+
+Long-running handlers block MuseRank's outbound request and waste retry
+budget. The SDK enforces a per-handler timeout (default 30 seconds) and
+exposes the abort signal via `context.signal`:
+
+```typescript
+onArticlePublished: async (article, _payload, ctx) => {
+  // `fetch` honors AbortSignal natively — pass it down so a timeout
+  // actually cancels the network call instead of waiting for it.
+  await fetch("https://my-cms.example.com/articles", {
+    method: "POST",
+    body: JSON.stringify(article),
+    signal: ctx.signal,
+  });
+}
+```
+
+Tune with `handlerTimeoutMs`:
+
+```typescript
+createMuseRankWebhook({
+  accessToken: process.env.MUSERANK_WEBHOOK_TOKEN!,
+  handlerTimeoutMs: 10_000, // tighter than default
+  // handlerTimeoutMs: 0,    // disable entirely (signal still present, never aborts)
+});
+```
+
+A timeout throws `WebhookHandlerTimeoutError` (a subclass of
+`WebhookProcessingError`) so the request returns 500 and MuseRank retries.
+
+## Response overrides — ack-and-drop poison messages
+
+Returning a 5xx tells MuseRank to retry. That's the right default, but
+some failures are permanent — a uniqueness constraint, a schema mismatch,
+a tenant that's been deleted. For those, return a structured override
+from `onError`:
+
+```typescript
+createMuseRankWebhook({
+  accessToken: process.env.MUSERANK_WEBHOOK_TOKEN!,
+
+  onArticlePublished: async (article) => {
+    await db.articles.create({ data: { externalId: article.id, ... } });
+  },
+
+  onError: (error) => {
+    // Already have this row — definitely don't retry.
+    if (error.message.includes("UNIQUE constraint")) {
+      return { statusCode: 200, success: true, message: "duplicate ignored" };
+    }
+    // Permanently broken payload — 4xx tells MuseRank to give up.
+    if (error.message.startsWith("Schema mismatch")) {
+      return { statusCode: 422, message: "unprocessable" };
+    }
+    // Otherwise let it 500 so MuseRank retries.
+    return undefined;
+  },
+});
+```
+
 ## Security
 
 ### Token Verification
@@ -269,11 +389,31 @@ createMuseRankWebhook({
 
 The SDK will verify the `X-MuseRank-Signature` header (format: `sha256=<lowercase hex>`) against an HMAC-SHA256 of the **raw** request body using your `signingSecret`. Signature comparison is constant-time.
 
+**Zero-downtime rotation**
+
+`signingSecret` accepts an array; every entry is tried (in constant
+time, so the loop runtime doesn't leak how many secrets you have).
+During a rotation deploy, ship the new secret first and keep the
+previous one in second position:
+
+```typescript
+createMuseRankWebhook({
+  accessToken: process.env.MUSERANK_WEBHOOK_TOKEN!,
+  signingSecret: [
+    process.env.MUSERANK_SIGNING_SECRET_NEW!, // matches new dispatcher
+    process.env.MUSERANK_SIGNING_SECRET_OLD!, // matches in-flight requests
+  ],
+});
+```
+
+Once you're confident no in-flight request still uses the old secret,
+drop it on the next deploy.
+
 **How to get the signing secret:**
 
 1. Open **Integrations → Webhook** in your MuseRank dashboard.
 2. On first connect, MuseRank generates a `whsec_…` signing secret and shows it **once** — copy it immediately into your environment as `MUSERANK_SIGNING_SECRET`.
-3. To rotate (e.g. after a suspected leak), use the **Rotate** action on the same screen. The previous secret stops verifying immediately, so update your receiver before traffic resumes.
+3. To rotate (e.g. after a suspected leak), use the **Rotate** action on the same screen. The previous secret stops verifying immediately — keep both in your SDK config during the rotation window.
 
 If you set `signingSecret` on the SDK side but the destination has no secret configured in MuseRank, every request will fail with `401 Invalid signature`. Either generate one in the dashboard, or remove the `signingSecret` option from the SDK config until you do.
 
@@ -357,15 +497,20 @@ The SDK provides typed errors for better error handling:
 import {
   WebhookVerificationError,
   WebhookProcessingError,
+  WebhookHandlerTimeoutError,
 } from '@muserank/webhook-sdk';
 
-// WebhookVerificationError - 400/401/413 response
-// 400: malformed payload or missing required fields
+// WebhookVerificationError — 400/401/413 response
+// 400: malformed payload, missing event_id, etc.
 // 401: auth/signature/timestamp verification failures
 // 413: payload exceeds configured size limit
 
-// WebhookProcessingError - 500 response
-// Thrown when event processing fails
+// WebhookProcessingError — 500 by default; statusCode/message overridable
+// via `onError` (see "Response overrides" above)
+
+// WebhookHandlerTimeoutError — subclass of WebhookProcessingError, thrown
+// when a handler exceeds `handlerTimeoutMs`. `instanceof` lets you
+// distinguish a timeout from an arbitrary handler bug.
 ```
 
 ## Generic Handler

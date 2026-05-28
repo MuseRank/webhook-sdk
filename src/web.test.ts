@@ -14,7 +14,10 @@ import type { WebhookPayload } from "./web";
 
 const VALID_TOKEN = "test-token";
 
+const SAMPLE_EVENT_ID = "evt_test_published";
+
 const validPayload: WebhookPayload = {
+  event_id: SAMPLE_EVENT_ID,
   event_type: "article.published",
   timestamp: new Date().toISOString(),
   data: {
@@ -158,5 +161,37 @@ describe("web adapter – createMuseRankWebhook", () => {
     expect(() =>
       createMuseRankWebhook({ accessToken: VALID_TOKEN, maxBodySizeBytes: -1 }),
     ).toThrow();
+  });
+
+  it("honors onError override (200 ack-and-drop on poison message)", async () => {
+    const handler = createMuseRankWebhook({
+      accessToken: VALID_TOKEN,
+      timestampToleranceMs: 0,
+      onArticlePublished: async () => {
+        throw new Error("duplicate row in receiver DB");
+      },
+      onError: () => ({ statusCode: 200, success: true, message: "ignored" }),
+    });
+    const res = await handler(makeRequest());
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.success).toBe(true);
+    expect(body.message).toBe("ignored");
+  });
+
+  it("honors onError override (4xx to stop retries on permanently bad payload)", async () => {
+    const handler = createMuseRankWebhook({
+      accessToken: VALID_TOKEN,
+      timestampToleranceMs: 0,
+      onArticlePublished: async () => {
+        throw new Error("schema mismatch");
+      },
+      onError: () => ({ statusCode: 422, message: "unprocessable" }),
+    });
+    const res = await handler(makeRequest());
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.success).toBe(false);
+    expect(body.error).toBe("unprocessable");
   });
 });

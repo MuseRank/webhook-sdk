@@ -1,8 +1,8 @@
 {
   "name": "@muserank/webhook-sdk",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "SDK for receiving MuseRank webhook events in your application",
-  "packageManager": "bun@1.2.0",
+  "packageManager": "bun@1.2.14",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
@@ -26,23 +26,28 @@
       "types": "./dist/express.d.ts",
       "import": "./dist/express.mjs",
       "require": "./dist/express.js"
-    }
+    },
+    "./payload.schema.json": "./payload.schema.json",
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",
+    "payload.schema.json",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "tsup src/index.ts src/web.ts src/nextjs.ts src/express.ts --format cjs,esm --dts --clean",
     "dev": "tsup src/index.ts src/web.ts src/nextjs.ts src/express.ts --format cjs,esm --dts --watch",
     "typecheck": "tsc --noEmit",
-    "lint": "npm run typecheck",
+    "schema:check": "node scripts/check-schema-fixtures.mjs",
+    "lint": "bun run typecheck && bun run schema:check",
     "test:run": "vitest --run",
     "test": "vitest",
-    "check": "npm run typecheck && npm run test:run && npm run build",
+    "check": "bun run lint && bun run test:run && bun run build",
     "pack:check": "npm pack --dry-run --cache ./.npm-cache",
-    "prepublishOnly": "npm run check"
+    "prepublishOnly": "bun run check"
   },
   "keywords": [
     "muserank",
@@ -70,6 +75,7 @@
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "^25.3.1",
+    "expect-type": "1.2.2",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
     "vitest": "^4.0.18"
