@@ -11,13 +11,15 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 255,
-      "description": "Stable identifier for the event (NOT the delivery attempt). Use as your idempotency key. Same event_id is sent on every retry of the same event."
+      "pattern": "^[!-~]+$",
+      "description": "Stable identifier for the event (NOT the delivery attempt). Use as your idempotency key. Same event_id is sent on every retry of the same event. Non-empty printable ASCII without whitespace (0x21-0x7E)."
     },
     "delivery_id": {
       "type": "string",
       "minLength": 1,
       "maxLength": 255,
-      "description": "Optional per-attempt delivery identifier. Changes on every retry. Use for cross-referencing receiver logs with MuseRank's outbound logs, NOT for idempotency."
+      "pattern": "^[!-~]+$",
+      "description": "Optional per-attempt delivery identifier. Changes on every retry. Use for cross-referencing receiver logs with MuseRank's outbound logs, NOT for idempotency. Same character set as event_id."
     },
     "event_type": {
       "type": "string",

@@ -89,7 +89,9 @@ export interface WebhookPayload<T extends WebhookEventType = WebhookEventType> {
    * timeout doesn't produce duplicate rows.
    *
    * Format is opaque (do not parse), but is guaranteed to be a
-   * non-empty ASCII string ≤ 255 chars.
+   * non-empty string of printable ASCII characters with no
+   * whitespace (`!`-`~`, i.e. ASCII 0x21–0x7E), ≤ 255 chars. Safe
+   * to use directly as a SQL identifier or HTTP header value.
    */
   event_id: string;
   /**
@@ -99,6 +101,9 @@ export interface WebhookPayload<T extends WebhookEventType = WebhookEventType> {
    * cross-referencing your receiver logs with MuseRank's outbound
    * delivery logs when debugging a specific failed attempt. Don't use
    * for idempotency — use `event_id` instead.
+   *
+   * When present, follows the same format as `event_id`: non-empty
+   * printable ASCII without whitespace, ≤ 255 chars.
    */
   delivery_id?: string;
   /** Type of event */
@@ -208,6 +213,18 @@ export interface WebhookConfig {
    * keep the previous secret in second position until you're sure
    * no in-flight requests still use it, then drop it on the next
    * deploy.
+   *
+   * Each secret is verified with a sequential async HMAC compute, so
+   * the total verification time grows linearly with the array length.
+   * Keep the array to ~2 entries (current + previous) during rotation
+   * so the wall-clock cost — which is observable to a network attacker
+   * — doesn't reveal more than the fact that rotation is in progress.
+   * The match itself is constant-time and never short-circuits, so
+   * *which* secret matched is not leaked.
+   *
+   * Empty arrays and arrays whose entries are all empty/non-string
+   * are rejected at handler creation, since they would otherwise
+   * make every incoming request fail with 401.
    */
   signingSecret?: string | readonly string[];
 
@@ -394,6 +411,23 @@ export class WebhookHandlerTimeoutError extends WebhookProcessingError {
  */
 export function isWebhookEventType(value: unknown): value is WebhookEventType {
   return typeof value === "string" && WEBHOOK_EVENT_TYPE_SET.has(value);
+}
+
+/**
+ * Validate that a value is a non-empty string of printable ASCII
+ * characters without whitespace (chars 0x21–0x7E), capped at 255
+ * chars. Used for `event_id` and `delivery_id`, both of which the
+ * dispatcher generates as opaque tokens and which MUST be safe to
+ * stuff into URL paths, HTTP headers, log lines and SQL UNIQUE
+ * columns without any extra escaping.
+ */
+function isOpaqueId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 255 &&
+    /^[\x21-\x7e]+$/.test(value)
+  );
 }
 
 /**
@@ -675,11 +709,7 @@ export function parseWebhookPayload(body: string | object): WebhookPayload {
     );
   }
 
-  if (
-    typeof candidatePayload.event_id !== "string" ||
-    candidatePayload.event_id.length === 0 ||
-    candidatePayload.event_id.length > 255
-  ) {
+  if (!isOpaqueId(candidatePayload.event_id)) {
     throw new WebhookVerificationError(
       "Missing or invalid event_id in payload",
       400,
@@ -688,9 +718,7 @@ export function parseWebhookPayload(body: string | object): WebhookPayload {
 
   if (
     candidatePayload.delivery_id !== undefined &&
-    (typeof candidatePayload.delivery_id !== "string" ||
-      candidatePayload.delivery_id.length === 0 ||
-      candidatePayload.delivery_id.length > 255)
+    !isOpaqueId(candidatePayload.delivery_id)
   ) {
     throw new WebhookVerificationError(
       "Invalid delivery_id in payload",
@@ -949,9 +977,26 @@ export async function processWebhookEvent(
         if (
           result &&
           typeof result === "object" &&
-          typeof result.statusCode === "number"
+          typeof (result as { statusCode?: unknown }).statusCode === "number"
         ) {
-          override = result;
+          const candidate = result as WebhookErrorOverride;
+          if (
+            Number.isInteger(candidate.statusCode) &&
+            candidate.statusCode >= 200 &&
+            candidate.statusCode <= 599
+          ) {
+            override = candidate;
+          } else {
+            // Invalid override would either crash the adapter
+            // (Response.json throws RangeError outside [200, 599], Node
+            // throws on NaN status) or produce a malformed response.
+            // Fall back to the default 500 path and surface the
+            // misconfiguration loudly so it's visible in logs.
+            console.warn(
+              `[MuseRank Webhook] onError returned invalid statusCode=${String(candidate.statusCode)}; ` +
+                "expected an integer in [200, 599]. Falling back to default 500 response.",
+            );
+          }
         }
       } catch (onErrorError) {
         // Don't let a buggy onError mask the real handler error.
@@ -1006,6 +1051,25 @@ export function createWebhookHandler(config: WebhookConfig) {
 
   if (handlerTimeoutMs < 0) {
     throw new Error("handlerTimeoutMs must be >= 0");
+  }
+
+  if (config.signingSecret !== undefined && Array.isArray(config.signingSecret)) {
+    if (config.signingSecret.length === 0) {
+      throw new Error(
+        "signingSecret array must not be empty. Pass `undefined` to disable " +
+          "signature verification, or include at least one non-empty secret string.",
+      );
+    }
+    const hasUsableSecret = config.signingSecret.some(
+      (secret) => typeof secret === "string" && secret.length > 0,
+    );
+    if (!hasUsableSecret) {
+      throw new Error(
+        "signingSecret array must contain at least one non-empty string. " +
+          "All entries are empty or non-string, which would make every " +
+          "request fail with 401 Invalid signature.",
+      );
+    }
   }
 
   return async (request: {

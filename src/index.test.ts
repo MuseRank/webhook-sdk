@@ -202,6 +202,58 @@ describe("parseWebhookPayload", () => {
     ).toThrow(/Invalid delivery_id/);
   });
 
+  it("rejects event_id containing non-ASCII characters", () => {
+    // The dispatcher contract guarantees a printable-ASCII opaque
+    // identifier so receivers can put it in URL paths, HTTP headers,
+    // and SQL UNIQUE columns without escaping. Emoji / CJK / accented
+    // characters would break that assumption.
+    for (const eventId of [
+      "evt_💥_abc",
+      "evt_中文_abc",
+      "evt_café_abc",
+      "evt_\u00a0_abc", // non-breaking space
+    ]) {
+      expect(() =>
+        parseWebhookPayload(basePayload({ event_id: eventId })),
+      ).toThrow(/Missing or invalid event_id/);
+    }
+  });
+
+  it("rejects event_id containing whitespace or control chars", () => {
+    for (const eventId of [
+      "evt with space",
+      "evt\twithtab",
+      "evt\nwithnewline",
+      "evt\x00withnul",
+      "evt\x7fwithdel",
+    ]) {
+      expect(() =>
+        parseWebhookPayload(basePayload({ event_id: eventId })),
+      ).toThrow(/Missing or invalid event_id/);
+    }
+  });
+
+  it("rejects delivery_id containing non-ASCII characters", () => {
+    expect(() =>
+      parseWebhookPayload(basePayload({ delivery_id: "dlv_💥_001" })),
+    ).toThrow(/Invalid delivery_id/);
+  });
+
+  it("accepts the full printable-ASCII range in event_id and delivery_id", () => {
+    // Sanity check — every printable ASCII char from `!` (0x21) to
+    // `~` (0x7E) MUST round-trip without rejection. Catches an
+    // accidental tightening of the regex (e.g. forgetting the `~`).
+    let asciiId = "";
+    for (let code = 0x21; code <= 0x7e; code += 1) {
+      asciiId += String.fromCharCode(code);
+    }
+    expect(() =>
+      parseWebhookPayload(
+        basePayload({ event_id: asciiId, delivery_id: asciiId }),
+      ),
+    ).not.toThrow();
+  });
+
   it("should throw on missing timestamp", () => {
     const payload = {
       event_id: SAMPLE_EVENT_ID,
@@ -399,6 +451,84 @@ describe("processWebhookEvent", () => {
       expect((err as WebhookProcessingError).override).toBeUndefined();
     }
   });
+
+  it.each([
+    ["NaN", Number.NaN],
+    ["Infinity", Number.POSITIVE_INFINITY],
+    ["-Infinity", Number.NEGATIVE_INFINITY],
+    ["0", 0],
+    ["-1", -1],
+    ["199 (below range)", 199],
+    ["600 (above range)", 600],
+    ["999999", 999_999],
+    ["non-integer 200.5", 200.5],
+  ])(
+    "ignores onError statusCode override that is %s",
+    async (_label, statusCode) => {
+      // Without this validation, NaN / out-of-range codes flow into
+      // res.status() / Response.json() and crash the adapter at
+      // write time (Node throws "Invalid status code: NaN"; Response
+      // throws RangeError). Falling back to undefined override means
+      // the adapter uses the default 500 path.
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const config: WebhookConfig = {
+          accessToken: "test",
+          onArticlePublished: async () => {
+            throw new Error("boom");
+          },
+          onError: () => ({ statusCode: statusCode as number }),
+        };
+        const payload: WebhookPayload = {
+          event_id: SAMPLE_EVENT_ID,
+          event_type: "article.published",
+          timestamp: "2024-01-01T00:00:00Z",
+          data: { articles: [mockArticle] },
+        };
+        try {
+          await processWebhookEvent(payload, config);
+          throw new Error("expected error to be thrown");
+        } catch (err) {
+          expect(err).toBeInstanceOf(WebhookProcessingError);
+          expect((err as WebhookProcessingError).override).toBeUndefined();
+        }
+        expect(warn).toHaveBeenCalledWith(
+          expect.stringContaining("invalid statusCode"),
+        );
+      } finally {
+        warn.mockRestore();
+      }
+    },
+  );
+
+  it.each([200, 204, 400, 404, 422, 500, 599])(
+    "honors onError statusCode override that is in [200, 599]: %i",
+    async (statusCode) => {
+      const config: WebhookConfig = {
+        accessToken: "test",
+        onArticlePublished: async () => {
+          throw new Error("boom");
+        },
+        onError: () => ({ statusCode }),
+      };
+      const payload: WebhookPayload = {
+        event_id: SAMPLE_EVENT_ID,
+        event_type: "article.published",
+        timestamp: "2024-01-01T00:00:00Z",
+        data: { articles: [mockArticle] },
+      };
+
+      try {
+        await processWebhookEvent(payload, config);
+        throw new Error("expected error to be thrown");
+      } catch (err) {
+        expect(err).toBeInstanceOf(WebhookProcessingError);
+        expect((err as WebhookProcessingError).override?.statusCode).toBe(
+          statusCode,
+        );
+      }
+    },
+  );
 
   it("survives an onError handler that itself throws", async () => {
     const config: WebhookConfig = {
@@ -781,6 +911,59 @@ describe("createWebhookHandler", () => {
       expect(error).toBeInstanceOf(WebhookVerificationError);
       expect((error as WebhookVerificationError).statusCode).toBe(413);
     }
+  });
+
+  it("rejects an empty signingSecret array at handler creation", () => {
+    // Empty arrays are TRUTHY in JS, so without this guard the
+    // handler would silently fail every request with 401 (the
+    // verifySignature loop iterates zero candidates and returns
+    // false). Catch the misconfiguration at config time instead.
+    expect(() =>
+      createWebhookHandler({
+        accessToken: "my-token",
+        signingSecret: [],
+      }),
+    ).toThrow(/signingSecret array must not be empty/);
+  });
+
+  it("rejects a signingSecret array of all-empty / non-string entries", () => {
+    expect(() =>
+      createWebhookHandler({
+        accessToken: "my-token",
+        signingSecret: ["", ""],
+      }),
+    ).toThrow(/at least one non-empty string/);
+
+    expect(() =>
+      createWebhookHandler({
+        accessToken: "my-token",
+        signingSecret: [
+          "",
+          undefined as unknown as string,
+          null as unknown as string,
+        ],
+      }),
+    ).toThrow(/at least one non-empty string/);
+  });
+
+  it("accepts a signingSecret array with at least one non-empty entry", () => {
+    // ['', 'real_secret'] is a legitimate config — e.g. an env-var
+    // driven array where the previous slot is intentionally blank
+    // outside a rotation window. As long as one usable entry exists,
+    // the handler should construct cleanly.
+    expect(() =>
+      createWebhookHandler({
+        accessToken: "my-token",
+        signingSecret: ["", "real_secret"],
+      }),
+    ).not.toThrow();
+
+    expect(() =>
+      createWebhookHandler({
+        accessToken: "my-token",
+        signingSecret: ["whsec_a", "whsec_b"],
+      }),
+    ).not.toThrow();
   });
 });
 

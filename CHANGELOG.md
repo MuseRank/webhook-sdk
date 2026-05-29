@@ -2,6 +2,40 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Stricter `event_id` / `delivery_id` validation.** The SDK now rejects
+  any non-empty string that contains characters outside the printable
+  ASCII range `0x21–0x7E`, matching the dispatcher contract. Emoji,
+  CJK, accented characters, and embedded whitespace / control chars
+  are refused with `400 Missing or invalid event_id in payload` (or
+  the corresponding `delivery_id` message). The JSON Schema now
+  carries the matching `pattern` constraint so non-TS receivers
+  enforce the same rule.
+- **`signingSecret` array misconfiguration is caught at handler creation.**
+  Passing `signingSecret: []`, `["", ""]`, or any array whose entries
+  are all empty/non-string used to silently fail every request with
+  `401 Invalid signature` because empty arrays are truthy in JS and
+  the verification loop iterated zero usable candidates. The handler
+  factory now throws a descriptive `Error` at construction time.
+  Arrays with at least one non-empty entry (e.g. `["", "real_secret"]`,
+  a common env-var pattern) keep working unchanged.
+- **`onError` response overrides are range-checked.** Returning
+  `{ statusCode }` from `onError` with a value that wasn't an integer
+  in `[200, 599]` (`NaN`, `Infinity`, `-1`, `0`, `999`, `200.5`, …)
+  used to flow straight into `res.status(...)` / `Response.json(...)`
+  and either crash the adapter (Node throws `Invalid status code: NaN`,
+  Web throws `RangeError`) or produce a malformed response. Invalid
+  overrides are now discarded with a `console.warn` and the default
+  `500` response path is used.
+- **Express adapter JSDoc** now includes a second `@example` showing
+  the `signingSecret` + `createRawBodyVerifier` combination, so users
+  enabling HMAC verification don't fall into the
+  `400 Raw request body is required for signature verification` trap
+  by copying the basic example.
+
 ## [3.0.0] - 2026-05-28
 
 ### Breaking changes

@@ -52,7 +52,7 @@ type ExpressNext = (error?: Error) => void;
  *
  * @example
  * ```typescript
- * // With express.json() middleware (recommended)
+ * // With express.json() middleware (recommended, no signature verification)
  * import express from 'express';
  * import { createMuseRankWebhook } from '@muserank/webhook-sdk/express';
  *
@@ -71,6 +71,34 @@ type ExpressNext = (error?: Error) => void;
  * }));
  *
  * app.listen(3000);
+ * ```
+ *
+ * @example
+ * ```typescript
+ * // With signingSecret enabled — express.json() consumes the request
+ * // stream, so the raw body must be captured BEFORE JSON parsing for
+ * // HMAC verification to work. Use `createRawBodyVerifier()` as the
+ * // `verify` hook on `express.json()` so both `req.body` (parsed) and
+ * // `req.rawBody` (Buffer) are populated.
+ * //
+ * // Without this, every request will fail with
+ * //   400 "Raw request body is required for signature verification".
+ * import express from 'express';
+ * import {
+ *   createMuseRankWebhook,
+ *   createRawBodyVerifier,
+ * } from '@muserank/webhook-sdk/express';
+ *
+ * const app = express();
+ * app.use(express.json({ verify: createRawBodyVerifier() }));
+ *
+ * app.post('/api/webhooks/muserank', createMuseRankWebhook({
+ *   accessToken: process.env.MUSERANK_WEBHOOK_TOKEN!,
+ *   signingSecret: process.env.MUSERANK_SIGNING_SECRET!,
+ *   onArticlePublished: async (article) => {
+ *     // …
+ *   },
+ * }));
  * ```
  */
 export function createMuseRankWebhook(config: WebhookConfig) {
