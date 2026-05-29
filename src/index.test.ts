@@ -558,3 +558,80 @@ describe("test.ping handling", () => {
     consoleSpy.mockRestore();
   });
 });
+
+
+describe("event_id (idempotency key)", () => {
+  const mockArticle = {
+    id: "article-1",
+    title: "Test Article",
+    content_markdown: "# Test",
+    content_html: "<h1>Test</h1>",
+    meta_description: "Test description",
+    created_at: "2024-01-01T00:00:00Z",
+    image_url: "https://example.com/image.jpg",
+    slug: "test-article",
+    tags: ["test"],
+  };
+
+  it("parses a payload that includes event_id", () => {
+    const payload = JSON.stringify({
+      event_type: "article.published",
+      event_id: "evt_123",
+      timestamp: "2024-01-01T00:00:00Z",
+      data: { articles: [] },
+    });
+
+    const result = parseWebhookPayload(payload);
+    expect(result.event_id).toBe("evt_123");
+  });
+
+  it("still parses a payload without event_id (backward compatible)", () => {
+    const payload = parseWebhookPayload({
+      event_type: "article.published",
+      timestamp: "2024-01-01T00:00:00Z",
+      data: { articles: [] },
+    });
+
+    expect(payload.event_id).toBeUndefined();
+  });
+
+  it("rejects a non-string event_id", () => {
+    const payload = {
+      event_type: "article.published",
+      event_id: 12345,
+      timestamp: "2024-01-01T00:00:00Z",
+      data: { articles: [] },
+    };
+
+    expect(() => parseWebhookPayload(payload)).toThrow(WebhookVerificationError);
+  });
+
+  it("surfaces eventId on the result when the payload carries event_id", async () => {
+    const config: WebhookConfig = { accessToken: "test" };
+    const payload: WebhookPayload<"article.published"> = {
+      event_type: "article.published",
+      event_id: "evt_abc",
+      timestamp: "2024-01-01T00:00:00Z",
+      data: { articles: [mockArticle] },
+    };
+
+    const result = await processWebhookEvent(payload, config);
+
+    expect(result.success).toBe(true);
+    expect(result.eventId).toBe("evt_abc");
+  });
+
+  it("omits eventId on the result when the payload has none", async () => {
+    const config: WebhookConfig = { accessToken: "test" };
+    const payload: WebhookPayload<"article.published"> = {
+      event_type: "article.published",
+      timestamp: "2024-01-01T00:00:00Z",
+      data: { articles: [mockArticle] },
+    };
+
+    const result = await processWebhookEvent(payload, config);
+
+    expect(result.success).toBe(true);
+    expect(result.eventId).toBeUndefined();
+  });
+});

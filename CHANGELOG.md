@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Support for a top-level `event_id` on webhook payloads — an at-least-once
+  idempotency key that is stable across delivery retries. Exposed as
+  `payload.event_id` and echoed on the result as `result.eventId`.
+- `parseWebhookPayload` now validates `event_id` is a string when present
+  (rejects non-string values with `400`); payloads without it remain accepted
+  for backward compatibility.
+
+### Documentation
+
+- Added an "Idempotency & delivery semantics" section and switched examples to
+  upserts.
+- Corrected the "Setting Up in MuseRank" steps (user-supplied access token vs.
+  MuseRank-generated `whsec_…` signing secret shown once).
+- Documented that `content_html` is the source of truth and `content_markdown`
+  is best-effort.
+
 ## [2.0.0] - 2026-02-26
 
 ### Changed

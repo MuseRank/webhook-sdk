@@ -59,6 +59,18 @@ export interface WebhookArticle {
 export interface WebhookPayload<T extends WebhookEventType = WebhookEventType> {
   /** Type of event */
   event_type: T;
+  /**
+   * Unique delivery/event identifier (e.g. `evt_…`).
+   *
+   * Present on events emitted by MuseRank's production dispatcher and stable
+   * across delivery retries of the same logical event. Webhook delivery is
+   * **at-least-once**, so use this value to deduplicate events and keep your
+   * handlers idempotent (see the "Idempotency" section in the README).
+   *
+   * Optional for backward compatibility with older senders that did not
+   * include it.
+   */
+  event_id?: string;
   /** ISO 8601 timestamp of when the event was triggered */
   timestamp: string;
   /** Event data */
@@ -181,6 +193,11 @@ export interface WebhookResult {
   success: boolean;
   message: string;
   eventType?: WebhookEventType;
+  /**
+   * Unique delivery/event identifier echoed from the payload's `event_id`,
+   * when present. Useful for logging and idempotent processing.
+   */
+  eventId?: string;
   articlesProcessed?: number;
 }
 
@@ -463,6 +480,7 @@ export function parseWebhookPayload(body: string | object): WebhookPayload {
 
   const candidatePayload = payload as {
     event_type?: unknown;
+    event_id?: unknown;
     timestamp?: unknown;
     data?: {
       articles?: unknown;
@@ -472,6 +490,16 @@ export function parseWebhookPayload(body: string | object): WebhookPayload {
   if (!isWebhookEventType(candidatePayload.event_type)) {
     throw new WebhookVerificationError(
       "Unsupported or missing event_type in payload",
+      400,
+    );
+  }
+
+  if (
+    candidatePayload.event_id !== undefined &&
+    typeof candidatePayload.event_id !== "string"
+  ) {
+    throw new WebhookVerificationError(
+      "Invalid event_id in payload (must be a string when present)",
       400,
     );
   }
@@ -594,6 +622,7 @@ export async function processWebhookEvent(
       success: true,
       message: `Successfully processed ${event_type} event`,
       eventType: event_type,
+      ...(payload.event_id ? { eventId: payload.event_id } : {}),
       articlesProcessed: articles.length,
     };
   } catch (error) {

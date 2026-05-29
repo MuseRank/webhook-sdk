@@ -31,8 +31,12 @@ export const POST = createMuseRankWebhook({
   accessToken: process.env.MUSERANK_WEBHOOK_TOKEN!,
   
   onArticlePublished: async (article) => {
-    await prisma.article.create({
-      data: {
+    // Webhook delivery is at-least-once — keep this idempotent.
+    // Upsert keyed on the stable article id so retries/redeliveries don't
+    // create duplicates. See the "Idempotency & delivery semantics" section.
+    await prisma.article.upsert({
+      where: { externalId: article.id },
+      create: {
         externalId: article.id,
         title: article.title,
         content: article.content_html,
@@ -41,6 +45,14 @@ export const POST = createMuseRankWebhook({
         featuredImage: article.image_url,
         tags: article.tags,
         publishedAt: new Date(article.created_at),
+      },
+      update: {
+        title: article.title,
+        content: article.content_html,
+        slug: article.slug,
+        metaDescription: article.meta_description,
+        featuredImage: article.image_url,
+        tags: article.tags,
       },
     });
   },
@@ -129,11 +141,16 @@ app.post('/api/webhooks/muserank', createMuseRankWebhook({
   accessToken: process.env.MUSERANK_WEBHOOK_TOKEN!,
   
   onArticlePublished: async (article) => {
-    await Article.create({
-      externalId: article.id,
-      title: article.title,
-      content: article.content_html,
-    });
+    // Delivery is at-least-once — upsert instead of insert so retries
+    // and redeliveries are safe (see "Idempotency & delivery semantics").
+    await Article.upsert(
+      {
+        externalId: article.id,
+        title: article.title,
+        content: article.content_html,
+      },
+      { conflictFields: ['externalId'] },
+    );
   },
 }));
 
@@ -227,23 +244,76 @@ interface WebhookConfig {
 | `article.failed` | Article publishing failed |
 | `test.ping` | Test event from MuseRank dashboard |
 
+## Webhook Payload
+
+Every webhook body shares the same envelope:
+
+```typescript
+interface WebhookPayload {
+  event_type: WebhookEventType; // e.g. "article.published"
+  event_id?: string;            // Unique delivery id (e.g. "evt_…"), stable across retries
+  timestamp: string;            // ISO 8601 time the event was dispatched
+  data: { articles: WebhookArticle[] };
+}
+```
+
+> `event_id` is your **idempotency key**. It is present on events from MuseRank's
+> production dispatcher and stays the same across delivery retries of the same
+> logical event. See [Idempotency & delivery semantics](#idempotency--delivery-semantics).
+
 ## Article Payload
 
 Each article in the webhook payload includes:
 
 ```typescript
 interface WebhookArticle {
-  id: string;              // Unique article ID
-  title: string;           // Article title
-  content_markdown: string; // Content in Markdown
-  content_html: string;     // Content in HTML
+  id: string;              // Unique article ID (stable — use as your idempotency/dedupe key)
+  title: string;           // Article title (the SEO title when one is set)
+  content_markdown: string; // Content in Markdown (best-effort, see note below)
+  content_html: string;     // Content in HTML (source of truth)
   meta_description: string; // SEO meta description
   created_at: string;       // ISO 8601 timestamp
-  image_url: string;        // Featured image URL
+  image_url: string;        // Featured image URL ("" when none)
   slug: string;             // URL-friendly slug
-  tags: string[];           // Associated tags/keywords
+  tags: string[];           // Associated tags/keywords ([] when none)
 }
 ```
+
+> **`content_html` is the source of truth.** `content_markdown` is generated
+> best-effort by converting the HTML and may be an empty string if conversion
+> fails — prefer `content_html` if you need guaranteed content.
+>
+> **`title`** reflects the article's SEO title when one is configured,
+> otherwise the editor title.
+
+## Idempotency & delivery semantics
+
+MuseRank delivers webhooks **at-least-once**: deliveries are retried with
+exponential backoff on transient failures, so your endpoint may legitimately
+receive the **same event more than once**. Make your handlers idempotent:
+
+- Deduplicate on `payload.event_id` (preferred) or on the stable `article.id`.
+- Use upserts (insert-or-update) rather than blind inserts.
+- Treat handler work as safe to repeat (e.g. avoid sending a duplicate
+  notification for an event you've already processed).
+
+```typescript
+onArticlePublished: async (article, payload) => {
+  // Skip if we've already handled this delivery
+  if (payload.event_id && (await seenEvent(payload.event_id))) return;
+
+  await db.articles.upsert({
+    where: { externalId: article.id },
+    create: { externalId: article.id, title: article.title, content: article.content_html },
+    update: { title: article.title, content: article.content_html },
+  });
+
+  if (payload.event_id) await markEventSeen(payload.event_id);
+},
+```
+
+The SDK also echoes the delivery id back to you on the `WebhookResult`
+(`result.eventId`) for logging.
 
 ## Security
 
@@ -413,11 +483,22 @@ import type {
 
 1. Go to **Integrations** in your MuseRank dashboard
 2. Click **Connect** on the Webhook card
-3. Enter your webhook endpoint URL (e.g., `https://yourdomain.com/api/webhooks/muserank`)
-4. Generate and copy an access token
+3. Enter your webhook endpoint URL (must be **HTTPS**, e.g. `https://yourdomain.com/api/webhooks/muserank`)
+4. Choose an **access token** (a secret string you create) — MuseRank sends it as
+   `Authorization: Bearer <token>`. Put the same value in the SDK's `accessToken`.
 5. Select which event types to receive
-6. Click **Connect Webhook**
-7. Use the **Test** button to verify your integration
+6. Click **Connect Webhook**. MuseRank then **generates an HMAC signing secret**
+   (`whsec_…`) and shows it **once** — copy it now and set it as the SDK's
+   `signingSecret` to enable signature verification. (You can later rotate it from
+   the dashboard; rotation is a hard cut-over with no grace period.)
+7. Use the **Test** button to send a signed `test.ping` and verify your integration
+
+```typescript
+createMuseRankWebhook({
+  accessToken: process.env.MUSERANK_WEBHOOK_TOKEN!,   // the token you entered in step 4
+  signingSecret: process.env.MUSERANK_SIGNING_SECRET, // the whsec_… shown once in step 6
+});
+```
 
 ## Examples
 
