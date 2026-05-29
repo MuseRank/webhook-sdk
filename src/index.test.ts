@@ -573,16 +573,30 @@ describe("event_id (idempotency key)", () => {
     tags: ["test"],
   };
 
+  // MuseRank emits event_id as evt_<32-hex> (36 chars total)
+  const validEventId = "evt_a3f2b1c4d5e6f7a8b9c0d1e2f3a4b5c6";
+  // MuseRank emits delivery_id as dlv_<24-hex> (28 chars total)
+  const validDeliveryId = "dlv_9f1a2b3c4d5e6f7a8b9c0d1e";
+
   it("parses a payload that includes event_id", () => {
-    const payload = JSON.stringify({
+    const result = parseWebhookPayload({
       event_type: "article.published",
-      event_id: "evt_123",
+      event_id: validEventId,
       timestamp: "2024-01-01T00:00:00Z",
       data: { articles: [] },
     });
+    expect(result.event_id).toBe(validEventId);
+  });
 
-    const result = parseWebhookPayload(payload);
-    expect(result.event_id).toBe("evt_123");
+  it("parses a payload that includes delivery_id", () => {
+    const result = parseWebhookPayload({
+      event_type: "article.published",
+      event_id: validEventId,
+      delivery_id: validDeliveryId,
+      timestamp: "2024-01-01T00:00:00Z",
+      data: { articles: [] },
+    });
+    expect(result.delivery_id).toBe(validDeliveryId);
   });
 
   it("still parses a payload without event_id (backward compatible)", () => {
@@ -591,26 +605,45 @@ describe("event_id (idempotency key)", () => {
       timestamp: "2024-01-01T00:00:00Z",
       data: { articles: [] },
     });
-
     expect(payload.event_id).toBeUndefined();
   });
 
-  it("rejects a non-string event_id", () => {
-    const payload = {
+  it("still parses a payload without delivery_id (backward compatible)", () => {
+    const payload = parseWebhookPayload({
       event_type: "article.published",
-      event_id: 12345,
       timestamp: "2024-01-01T00:00:00Z",
       data: { articles: [] },
-    };
+    });
+    expect(payload.delivery_id).toBeUndefined();
+  });
 
-    expect(() => parseWebhookPayload(payload)).toThrow(WebhookVerificationError);
+  it("rejects a non-string event_id", () => {
+    expect(() =>
+      parseWebhookPayload({
+        event_type: "article.published",
+        event_id: 12345,
+        timestamp: "2024-01-01T00:00:00Z",
+        data: { articles: [] },
+      }),
+    ).toThrow(WebhookVerificationError);
+  });
+
+  it("rejects a non-string delivery_id", () => {
+    expect(() =>
+      parseWebhookPayload({
+        event_type: "article.published",
+        delivery_id: true,
+        timestamp: "2024-01-01T00:00:00Z",
+        data: { articles: [] },
+      }),
+    ).toThrow(WebhookVerificationError);
   });
 
   it("surfaces eventId on the result when the payload carries event_id", async () => {
     const config: WebhookConfig = { accessToken: "test" };
     const payload: WebhookPayload<"article.published"> = {
       event_type: "article.published",
-      event_id: "evt_abc",
+      event_id: validEventId,
       timestamp: "2024-01-01T00:00:00Z",
       data: { articles: [mockArticle] },
     };
@@ -618,10 +651,27 @@ describe("event_id (idempotency key)", () => {
     const result = await processWebhookEvent(payload, config);
 
     expect(result.success).toBe(true);
-    expect(result.eventId).toBe("evt_abc");
+    expect(result.eventId).toBe(validEventId);
   });
 
-  it("omits eventId on the result when the payload has none", async () => {
+  it("surfaces deliveryId on the result when the payload carries delivery_id", async () => {
+    const config: WebhookConfig = { accessToken: "test" };
+    const payload: WebhookPayload<"article.published"> = {
+      event_type: "article.published",
+      event_id: validEventId,
+      delivery_id: validDeliveryId,
+      timestamp: "2024-01-01T00:00:00Z",
+      data: { articles: [mockArticle] },
+    };
+
+    const result = await processWebhookEvent(payload, config);
+
+    expect(result.success).toBe(true);
+    expect(result.eventId).toBe(validEventId);
+    expect(result.deliveryId).toBe(validDeliveryId);
+  });
+
+  it("omits eventId and deliveryId on the result when the payload has neither", async () => {
     const config: WebhookConfig = { accessToken: "test" };
     const payload: WebhookPayload<"article.published"> = {
       event_type: "article.published",
@@ -633,5 +683,6 @@ describe("event_id (idempotency key)", () => {
 
     expect(result.success).toBe(true);
     expect(result.eventId).toBeUndefined();
+    expect(result.deliveryId).toBeUndefined();
   });
 });

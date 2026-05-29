@@ -251,14 +251,19 @@ Every webhook body shares the same envelope:
 ```typescript
 interface WebhookPayload {
   event_type: WebhookEventType; // e.g. "article.published"
-  event_id?: string;            // Unique delivery id (e.g. "evt_…"), stable across retries
+  event_id?: string;            // Stable idempotency key: evt_<32-hex> (36 chars)
+  delivery_id?: string;         // Per-attempt correlation id: dlv_<24-hex> (28 chars)
   timestamp: string;            // ISO 8601 time the event was dispatched
   data: { articles: WebhookArticle[] };
 }
 ```
 
+Both fields are also sent as request headers:
+- `X-MuseRank-Event-ID` — stable across retries, use for deduplication
+- `X-MuseRank-Delivery-ID` — unique per attempt, use for log correlation only
+
 > `event_id` is your **idempotency key**. It is present on events from MuseRank's
-> production dispatcher and stays the same across delivery retries of the same
+> production dispatcher and stays the same across all delivery retries of the same
 > logical event. See [Idempotency & delivery semantics](#idempotency--delivery-semantics).
 
 ## Article Payload
@@ -292,14 +297,14 @@ MuseRank delivers webhooks **at-least-once**: deliveries are retried with
 exponential backoff on transient failures, so your endpoint may legitimately
 receive the **same event more than once**. Make your handlers idempotent:
 
-- Deduplicate on `payload.event_id` (preferred) or on the stable `article.id`.
+- Deduplicate on `payload.event_id` (preferred — `evt_<32-hex>`, stable across all retries of the same event) or on the stable `article.id`.
+- `payload.delivery_id` (`dlv_<24-hex>`) is **fresh per attempt** — use it only for correlating a specific retry with MuseRank's logs, never for deduplication.
 - Use upserts (insert-or-update) rather than blind inserts.
-- Treat handler work as safe to repeat (e.g. avoid sending a duplicate
-  notification for an event you've already processed).
+- Treat handler work as safe to repeat (e.g. avoid sending a duplicate notification for an event you've already processed).
 
 ```typescript
 onArticlePublished: async (article, payload) => {
-  // Skip if we've already handled this delivery
+  // Skip if we've already handled this logical event
   if (payload.event_id && (await seenEvent(payload.event_id))) return;
 
   await db.articles.upsert({
@@ -309,11 +314,13 @@ onArticlePublished: async (article, payload) => {
   });
 
   if (payload.event_id) await markEventSeen(payload.event_id);
+  // payload.delivery_id is useful here only for logging which attempt this was:
+  // console.log('processed delivery', payload.delivery_id);
 },
 ```
 
-The SDK also echoes the delivery id back to you on the `WebhookResult`
-(`result.eventId`) for logging.
+The SDK echoes both ids back to you on `WebhookResult` as `result.eventId`
+and `result.deliveryId` for logging.
 
 ## Security
 

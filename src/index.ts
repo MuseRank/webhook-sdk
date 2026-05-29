@@ -60,17 +60,33 @@ export interface WebhookPayload<T extends WebhookEventType = WebhookEventType> {
   /** Type of event */
   event_type: T;
   /**
-   * Unique delivery/event identifier (e.g. `evt_…`).
+   * Stable idempotency key for this logical event. Format: `evt_<32-hex>`
+   * (36 chars total, e.g. `evt_a3f2b1c4d5e6f7a8b9c0d1e2f3a4b5c6`).
    *
-   * Present on events emitted by MuseRank's production dispatcher and stable
-   * across delivery retries of the same logical event. Webhook delivery is
-   * **at-least-once**, so use this value to deduplicate events and keep your
-   * handlers idempotent (see the "Idempotency" section in the README).
+   * Anchored on `article.updatedAt` at enqueue time so every BullMQ retry
+   * of the same logical event carries the same value. Use this to
+   * deduplicate deliveries in your handler — see the "Idempotency &
+   * delivery semantics" section in the README.
    *
-   * Optional for backward compatibility with older senders that did not
-   * include it.
+   * Also sent as the `X-MuseRank-Event-ID` request header.
+   *
+   * Optional for backward compatibility with senders predating this field.
    */
   event_id?: string;
+  /**
+   * Per-attempt delivery identifier. Format: `dlv_<24-hex>` (28 chars,
+   * e.g. `dlv_9f1a2b3c4d5e6f7a8b9c0d1e`).
+   *
+   * Unlike `event_id`, this is minted fresh for every delivery attempt so
+   * you can correlate a specific retry with MuseRank's outbound logs
+   * without conflating it with sibling attempts. Do **not** use this for
+   * deduplication — use `event_id` instead.
+   *
+   * Also sent as the `X-MuseRank-Delivery-ID` request header.
+   *
+   * Optional for backward compatibility with senders predating this field.
+   */
+  delivery_id?: string;
   /** ISO 8601 timestamp of when the event was triggered */
   timestamp: string;
   /** Event data */
@@ -194,10 +210,16 @@ export interface WebhookResult {
   message: string;
   eventType?: WebhookEventType;
   /**
-   * Unique delivery/event identifier echoed from the payload's `event_id`,
-   * when present. Useful for logging and idempotent processing.
+   * Echoed from `payload.event_id` when present (`evt_<32-hex>`).
+   * Stable idempotency key — the same value across all retries of the
+   * same logical event. Use for deduplication and logging.
    */
   eventId?: string;
+  /**
+   * Echoed from `payload.delivery_id` when present (`dlv_<24-hex>`).
+   * Unique per delivery attempt — use for log correlation only.
+   */
+  deliveryId?: string;
   articlesProcessed?: number;
 }
 
@@ -481,6 +503,7 @@ export function parseWebhookPayload(body: string | object): WebhookPayload {
   const candidatePayload = payload as {
     event_type?: unknown;
     event_id?: unknown;
+    delivery_id?: unknown;
     timestamp?: unknown;
     data?: {
       articles?: unknown;
@@ -500,6 +523,16 @@ export function parseWebhookPayload(body: string | object): WebhookPayload {
   ) {
     throw new WebhookVerificationError(
       "Invalid event_id in payload (must be a string when present)",
+      400,
+    );
+  }
+
+  if (
+    candidatePayload.delivery_id !== undefined &&
+    typeof candidatePayload.delivery_id !== "string"
+  ) {
+    throw new WebhookVerificationError(
+      "Invalid delivery_id in payload (must be a string when present)",
       400,
     );
   }
@@ -623,6 +656,7 @@ export async function processWebhookEvent(
       message: `Successfully processed ${event_type} event`,
       eventType: event_type,
       ...(payload.event_id ? { eventId: payload.event_id } : {}),
+      ...(payload.delivery_id ? { deliveryId: payload.delivery_id } : {}),
       articlesProcessed: articles.length,
     };
   } catch (error) {
