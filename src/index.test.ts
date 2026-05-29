@@ -558,3 +558,131 @@ describe("test.ping handling", () => {
     consoleSpy.mockRestore();
   });
 });
+
+
+describe("event_id (idempotency key)", () => {
+  const mockArticle = {
+    id: "article-1",
+    title: "Test Article",
+    content_markdown: "# Test",
+    content_html: "<h1>Test</h1>",
+    meta_description: "Test description",
+    created_at: "2024-01-01T00:00:00Z",
+    image_url: "https://example.com/image.jpg",
+    slug: "test-article",
+    tags: ["test"],
+  };
+
+  // MuseRank emits event_id as evt_<32-hex> (36 chars total)
+  const validEventId = "evt_a3f2b1c4d5e6f7a8b9c0d1e2f3a4b5c6";
+  // MuseRank emits delivery_id as dlv_<24-hex> (28 chars total)
+  const validDeliveryId = "dlv_9f1a2b3c4d5e6f7a8b9c0d1e";
+
+  it("parses a payload that includes event_id", () => {
+    const result = parseWebhookPayload({
+      event_type: "article.published",
+      event_id: validEventId,
+      timestamp: "2024-01-01T00:00:00Z",
+      data: { articles: [] },
+    });
+    expect(result.event_id).toBe(validEventId);
+  });
+
+  it("parses a payload that includes delivery_id", () => {
+    const result = parseWebhookPayload({
+      event_type: "article.published",
+      event_id: validEventId,
+      delivery_id: validDeliveryId,
+      timestamp: "2024-01-01T00:00:00Z",
+      data: { articles: [] },
+    });
+    expect(result.delivery_id).toBe(validDeliveryId);
+  });
+
+  it("still parses a payload without event_id (backward compatible)", () => {
+    const payload = parseWebhookPayload({
+      event_type: "article.published",
+      timestamp: "2024-01-01T00:00:00Z",
+      data: { articles: [] },
+    });
+    expect(payload.event_id).toBeUndefined();
+  });
+
+  it("still parses a payload without delivery_id (backward compatible)", () => {
+    const payload = parseWebhookPayload({
+      event_type: "article.published",
+      timestamp: "2024-01-01T00:00:00Z",
+      data: { articles: [] },
+    });
+    expect(payload.delivery_id).toBeUndefined();
+  });
+
+  it("rejects a non-string event_id", () => {
+    expect(() =>
+      parseWebhookPayload({
+        event_type: "article.published",
+        event_id: 12345,
+        timestamp: "2024-01-01T00:00:00Z",
+        data: { articles: [] },
+      }),
+    ).toThrow(WebhookVerificationError);
+  });
+
+  it("rejects a non-string delivery_id", () => {
+    expect(() =>
+      parseWebhookPayload({
+        event_type: "article.published",
+        delivery_id: true,
+        timestamp: "2024-01-01T00:00:00Z",
+        data: { articles: [] },
+      }),
+    ).toThrow(WebhookVerificationError);
+  });
+
+  it("surfaces eventId on the result when the payload carries event_id", async () => {
+    const config: WebhookConfig = { accessToken: "test" };
+    const payload: WebhookPayload<"article.published"> = {
+      event_type: "article.published",
+      event_id: validEventId,
+      timestamp: "2024-01-01T00:00:00Z",
+      data: { articles: [mockArticle] },
+    };
+
+    const result = await processWebhookEvent(payload, config);
+
+    expect(result.success).toBe(true);
+    expect(result.eventId).toBe(validEventId);
+  });
+
+  it("surfaces deliveryId on the result when the payload carries delivery_id", async () => {
+    const config: WebhookConfig = { accessToken: "test" };
+    const payload: WebhookPayload<"article.published"> = {
+      event_type: "article.published",
+      event_id: validEventId,
+      delivery_id: validDeliveryId,
+      timestamp: "2024-01-01T00:00:00Z",
+      data: { articles: [mockArticle] },
+    };
+
+    const result = await processWebhookEvent(payload, config);
+
+    expect(result.success).toBe(true);
+    expect(result.eventId).toBe(validEventId);
+    expect(result.deliveryId).toBe(validDeliveryId);
+  });
+
+  it("omits eventId and deliveryId on the result when the payload has neither", async () => {
+    const config: WebhookConfig = { accessToken: "test" };
+    const payload: WebhookPayload<"article.published"> = {
+      event_type: "article.published",
+      timestamp: "2024-01-01T00:00:00Z",
+      data: { articles: [mockArticle] },
+    };
+
+    const result = await processWebhookEvent(payload, config);
+
+    expect(result.success).toBe(true);
+    expect(result.eventId).toBeUndefined();
+    expect(result.deliveryId).toBeUndefined();
+  });
+});
