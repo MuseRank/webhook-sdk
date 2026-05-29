@@ -88,9 +88,15 @@ export function createMuseRankWebhook(config: WebhookConfig) {
       }
 
       if (error instanceof WebhookProcessingError) {
+        const override = error.override;
+        const status = override?.statusCode ?? 500;
+        const success = override?.success ?? status < 400;
+        const message = override?.message ?? error.message;
         return Response.json(
-          { success: false, error: error.message },
-          { status: 500 },
+          success
+            ? { success: true, message }
+            : { success: false, error: message },
+          { status },
         );
       }
 
@@ -185,7 +191,15 @@ export function createMuseRankPagesWebhook(config: WebhookConfig) {
       }
 
       if (error instanceof WebhookProcessingError) {
-        res.status(500).json({ success: false, error: error.message });
+        const override = error.override;
+        const status = override?.statusCode ?? 500;
+        const success = override?.success ?? status < 400;
+        const message = override?.message ?? error.message;
+        res.status(status).json(
+          success
+            ? { success: true, message }
+            : { success: false, error: message },
+        );
         return;
       }
 

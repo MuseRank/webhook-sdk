@@ -162,10 +162,16 @@ export function createMuseRankWebhook(config: WebhookConfig) {
       }
 
       if (error instanceof WebhookProcessingError) {
+        const override = error.override;
+        const status = override?.statusCode ?? 500;
+        const success = override?.success ?? status < 400;
+        const message = override?.message ?? error.message;
         return new Response(
-          JSON.stringify({ success: false, error: error.message }),
+          JSON.stringify(
+            success ? { success: true, message } : { success: false, error: message },
+          ),
           {
-            status: 500,
+            status,
             headers: { "Content-Type": "application/json" },
           },
         );

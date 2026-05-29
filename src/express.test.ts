@@ -20,7 +20,10 @@ import { createHmac } from "crypto";
 
 const VALID_TOKEN = "test-token";
 
+const SAMPLE_EVENT_ID = "evt_test_express_published";
+
 const validPayload: WebhookPayload = {
+  event_id: SAMPLE_EVENT_ID,
   event_type: "article.published",
   timestamp: new Date().toISOString(),
   data: {
