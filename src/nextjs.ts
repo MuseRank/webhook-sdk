@@ -13,6 +13,7 @@ import {
 } from "./index";
 import type { WebhookConfig } from "./index";
 import {
+  assertAuthorizedBeforeBody,
   enforceBodyStringLimit,
   enforceBodyObjectLimit,
   readFetchBodyWithLimit,
@@ -63,14 +64,17 @@ export function createMuseRankWebhook(config: WebhookConfig) {
     }
 
     try {
-      // Parse request body
-      const body = await readFetchBodyWithLimit(request, maxBodySizeBytes);
-
       // Get headers
       const headers: Record<string, string | undefined> = {};
       request.headers.forEach((value, key) => {
         headers[key.toLowerCase()] = value;
       });
+
+      // Reject unauthenticated requests before buffering the body
+      assertAuthorizedBeforeBody(headers, config.accessToken);
+
+      // Parse request body
+      const body = await readFetchBodyWithLimit(request, maxBodySizeBytes);
 
       // Process webhook
       const result = await handler({
@@ -88,9 +92,15 @@ export function createMuseRankWebhook(config: WebhookConfig) {
       }
 
       if (error instanceof WebhookProcessingError) {
+        const override = error.override;
+        const status = override?.statusCode ?? 500;
+        const success = override?.success ?? status < 400;
+        const message = override?.message ?? error.message;
         return Response.json(
-          { success: false, error: error.message },
-          { status: 500 },
+          success
+            ? { success: true, message }
+            : { success: false, error: message },
+          { status },
         );
       }
 
@@ -150,6 +160,9 @@ export function createMuseRankPagesWebhook(config: WebhookConfig) {
         headers[key.toLowerCase()] = Array.isArray(value) ? value[0] : value;
       }
 
+      // Reject unauthenticated requests before reading the raw stream
+      assertAuthorizedBeforeBody(headers, config.accessToken);
+
       // Get body (may need to read from raw stream if bodyParser is disabled)
       let body: string | object;
       if (typeof req.body === "string") {
@@ -185,7 +198,15 @@ export function createMuseRankPagesWebhook(config: WebhookConfig) {
       }
 
       if (error instanceof WebhookProcessingError) {
-        res.status(500).json({ success: false, error: error.message });
+        const override = error.override;
+        const status = override?.statusCode ?? 500;
+        const success = override?.success ?? status < 400;
+        const message = override?.message ?? error.message;
+        res.status(status).json(
+          success
+            ? { success: true, message }
+            : { success: false, error: message },
+        );
         return;
       }
 

@@ -35,21 +35,50 @@ export type WebhookEventType =
 export interface WebhookArticle {
   /** Unique article ID */
   id: string;
-  /** Article title (may include SEO title) */
+  /**
+   * Article title as it should appear to readers and search engines.
+   * MuseRank prefers the SEO-optimized title (`seoTitle`) when set and
+   * falls back to the editorial title otherwise. Treat this as the
+   * authoritative public title.
+   */
   title: string;
-  /** Article content in Markdown format */
+  /**
+   * Article content rendered as Markdown.
+   * Produced by converting the editor's HTML through Turndown so it
+   * round-trips into Markdown-native targets (Contentful long-text,
+   * Ghost, MDX) without manual cleanup. May be `""` when the article
+   * has no content yet — always check before persisting.
+   */
   content_markdown: string;
-  /** Article content in HTML format */
+  /**
+   * Article content as raw HTML, exactly as edited in the MuseRank
+   * Tiptap editor. Use this when your destination is HTML-native
+   * (a CMS, an `<article>` tag, an Email Builder).
+   */
   content_html: string;
   /** Meta description for SEO */
   meta_description: string;
-  /** ISO 8601 timestamp of article creation */
+  /**
+   * ISO 8601 timestamp of when the article was created in MuseRank.
+   * This is NOT the publish time; for `article.published` use
+   * `payload.timestamp` (the dispatch time) if you need one.
+   */
   created_at: string;
-  /** Featured image URL (if any) */
+  /** Featured image URL, or `""` when none is set */
   image_url: string;
-  /** URL-friendly slug */
+  /**
+   * URL-friendly slug, derived from the article's editorial title
+   * (not from `title`, which prefers the SEO title). It changes if the
+   * editorial title changes, so key your records on `id`, not `slug`.
+   */
   slug: string;
-  /** Associated tags/keywords */
+  /**
+   * Topical tags for the article. MuseRank derives these from the
+   * primary keyword, the SEO focus keyphrase, and any sibling
+   * keywords assigned to the article in the topical map. Order is
+   * stable: `tags[0]` is always the primary keyword. Duplicates are
+   * removed case-insensitively.
+   */
   tags: string[];
 }
 
@@ -57,6 +86,34 @@ export interface WebhookArticle {
  * Base webhook payload structure
  */
 export interface WebhookPayload<T extends WebhookEventType = WebhookEventType> {
+  /**
+   * Stable identifier for the *event* (NOT the delivery attempt).
+   *
+   * The dispatcher derives this deterministically from the article id,
+   * event type, and the article's `updated_at` timestamp, so retries
+   * of the same event always carry the same `event_id`. Use this as
+   * your idempotency key — typically as a `UNIQUE` column in your
+   * receiver database — so a re-delivered event after a client-side
+   * timeout doesn't produce duplicate rows.
+   *
+   * Format is opaque (do not parse), but is guaranteed to be a
+   * non-empty string of printable ASCII characters with no
+   * whitespace (`!`-`~`, i.e. ASCII 0x21–0x7E), ≤ 255 chars. Safe
+   * to use directly as a SQL identifier or HTTP header value.
+   */
+  event_id: string;
+  /**
+   * Optional, per-attempt delivery identifier.
+   *
+   * Unlike `event_id`, this changes on every retry. Useful for
+   * cross-referencing your receiver logs with MuseRank's outbound
+   * delivery logs when debugging a specific failed attempt. Don't use
+   * for idempotency — use `event_id` instead.
+   *
+   * When present, follows the same format as `event_id`: non-empty
+   * printable ASCII without whitespace, ≤ 255 chars.
+   */
+  delivery_id?: string;
   /** Type of event */
   event_type: T;
   /** ISO 8601 timestamp of when the event was triggered */
@@ -81,9 +138,89 @@ export const DEFAULT_TIMESTAMP_TOLERANCE_MS = 5 * 60 * 1000;
 export const CLOCK_SKEW_TOLERANCE_MS = 30_000; // 30 seconds
 
 /**
- * Default max payload size: 1 MB
+ * Default max payload size: 5 MiB.
+ *
+ * MuseRank accepts article HTML up to 2,000,000 characters and every
+ * article payload carries that HTML twice (`content_html` plus the
+ * converted `content_markdown`), so a legitimate payload can reach
+ * roughly 4–5 MB. A smaller default would make MuseRank's long
+ * articles fail with 413, which MuseRank treats as a permanent
+ * failure and does not retry.
+ *
+ * The `/web` and `/nextjs` adapters (and the `/express` handler when it
+ * reads the request stream itself) check the `Authorization` header
+ * before reading the body, so an unauthenticated client cannot make
+ * the SDK buffer this much. Body-parsing middleware that runs first
+ * (`express.json()`, `rawBodyMiddleware`) reads the body before any
+ * check, so give it a deliberate `limit`.
  */
-export const DEFAULT_MAX_BODY_SIZE_BYTES = 1024 * 1024;
+export const DEFAULT_MAX_BODY_SIZE_BYTES = 5 * 1024 * 1024;
+
+/**
+ * How long MuseRank waits for your endpoint to respond before it
+ * aborts the delivery attempt and schedules a retry.
+ */
+export const MUSERANK_DELIVERY_TIMEOUT_MS = 30_000;
+
+/**
+ * Default per-handler timeout: 25 seconds.
+ *
+ * Long-running event handlers block the inbound HTTP response, and
+ * MuseRank aborts each delivery attempt after
+ * {@link MUSERANK_DELIVERY_TIMEOUT_MS} (30s). The default stays below
+ * that so the SDK answers with a 500 (and MuseRank retries cleanly)
+ * before MuseRank gives up on the connection while your handler is
+ * still running.
+ */
+export const DEFAULT_HANDLER_TIMEOUT_MS = 25_000;
+
+/**
+ * Per-event context passed to every handler as the third argument.
+ *
+ * - `eventId` / `deliveryId` mirror the payload fields so handlers
+ *   that bind via `onEvent` or take only the article don't need to
+ *   re-extract them.
+ * - `signal` aborts when `handlerTimeoutMs` elapses. Long-running I/O
+ *   should pass it to `fetch`, `AbortController`-aware DB drivers, or
+ *   read it directly to short-circuit work.
+ */
+export interface WebhookContext {
+  /** Idempotency key for this event (stable across retries). */
+  eventId: string;
+  /** Per-attempt id (varies across retries), if MuseRank sent one. */
+  deliveryId: string | undefined;
+  /**
+   * Abort signal that fires when `handlerTimeoutMs` expires (or
+   * immediately, if a previous handler in the same request already
+   * timed out). Always present — even when `handlerTimeoutMs` is `0`
+   * (in which case the signal simply never aborts).
+   */
+  signal: AbortSignal;
+}
+
+/**
+ * Result returned from `onError` to override the default response.
+ *
+ * Returning this from `onError` tells the SDK to send a custom HTTP
+ * response *instead of* the default 500 — useful when you've decided
+ * the message is poison (return 4xx so MuseRank stops retrying) or
+ * when you want to ack-and-drop a transient error (return 200).
+ *
+ * Returning `void` / `undefined` keeps the default behavior:
+ * `WebhookProcessingError` → 500.
+ */
+export interface WebhookErrorOverride {
+  /** HTTP status code to send (200–599). */
+  statusCode: number;
+  /** Response body's `error` field. Defaults to the original error message. */
+  message?: string;
+  /**
+   * If `true`, treat the request as successfully processed (`success:
+   * true` in the JSON body). Useful when ack-and-dropping at 200.
+   * Defaults to `statusCode < 400`.
+   */
+  success?: boolean;
+}
 
 /**
  * Webhook configuration options
@@ -96,10 +233,35 @@ export interface WebhookConfig {
   accessToken: string;
 
   /**
-   * Optional: Webhook signing secret for HMAC verification.
+   * Optional: Webhook signing secret(s) for HMAC verification.
    * If provided, the X-MuseRank-Signature header will be validated.
+   *
+   * Pass an array to accept more than one secret — every secret in
+   * the array is tried and the request is accepted if any one of
+   * them matches.
+   *
+   * MuseRank signs every delivery attempt (including retries) with
+   * the secret that is current at send time, and **Rotate** in the
+   * dashboard takes effect immediately. Deliveries sent after the
+   * rotation and before your endpoint knows the new secret fail with
+   * 401, and MuseRank does not retry 4xx responses. To keep that
+   * window short, deploy `[newSecret, oldSecret]` right after
+   * rotating (the old entry only covers requests already in flight),
+   * then drop the old secret.
+   *
+   * Each secret is verified with a sequential async HMAC compute, so
+   * the total verification time grows linearly with the array length.
+   * Keep the array to ~2 entries (current + previous) during rotation
+   * so the wall-clock cost — which is observable to a network attacker
+   * — doesn't reveal more than the fact that rotation is in progress.
+   * The match itself is constant-time and never short-circuits, so
+   * *which* secret matched is not leaked.
+   *
+   * Empty arrays and arrays whose entries are all empty/non-string
+   * are rejected at handler creation, since they would otherwise
+   * make every incoming request fail with 401.
    */
-  signingSecret?: string;
+  signingSecret?: string | readonly string[];
 
   /**
    * Optional: Maximum age of webhook timestamp in milliseconds.
@@ -111,11 +273,30 @@ export interface WebhookConfig {
 
   /**
    * Optional: Maximum webhook body size in bytes.
-   * Requests exceeding this limit are rejected with status 413.
-   * Default: 1MB (1048576 bytes)
+   * Requests exceeding this limit are rejected with status 413, which
+   * MuseRank treats as permanent (no retry).
+   * Default: 5 MiB ({@link DEFAULT_MAX_BODY_SIZE_BYTES}), sized for
+   * MuseRank's largest articles. Lowering it can reject real articles.
    * Set to 0 to disable body size verification.
    */
   maxBodySizeBytes?: number;
+
+  /**
+   * Optional: Maximum time, in milliseconds, that a single event
+   * handler is allowed to run before its `signal` is aborted and the
+   * SDK fails the request.
+   *
+   * Default: 25s ({@link DEFAULT_HANDLER_TIMEOUT_MS}), below MuseRank's
+   * 30s delivery timeout. Values above 30s let MuseRank abort the
+   * attempt and retry while your handler is still running. Set to `0`
+   * to disable the timeout entirely (the abort signal will still be
+   * present on `WebhookContext`, it just never fires).
+   *
+   * The timer is per-handler-call: an `article.published` event with
+   * 3 articles in `data.articles` gets 3 timers, not one combined
+   * budget. MuseRank currently sends one article per event.
+   */
+  handlerTimeoutMs?: number;
 
   /**
    * Handler for article.published events
@@ -123,6 +304,7 @@ export interface WebhookConfig {
   onArticlePublished?: (
     article: WebhookArticle,
     payload: WebhookPayload<"article.published">,
+    context: WebhookContext,
   ) => Promise<void> | void;
 
   /**
@@ -131,6 +313,7 @@ export interface WebhookConfig {
   onArticleUpdated?: (
     article: WebhookArticle,
     payload: WebhookPayload<"article.updated">,
+    context: WebhookContext,
   ) => Promise<void> | void;
 
   /**
@@ -139,6 +322,7 @@ export interface WebhookConfig {
   onArticleScheduled?: (
     article: WebhookArticle,
     payload: WebhookPayload<"article.scheduled">,
+    context: WebhookContext,
   ) => Promise<void> | void;
 
   /**
@@ -147,13 +331,17 @@ export interface WebhookConfig {
   onArticleFailed?: (
     article: WebhookArticle,
     payload: WebhookPayload<"article.failed">,
+    context: WebhookContext,
   ) => Promise<void> | void;
 
   /**
    * Handler for test.ping events (from the Test button in MuseRank)
    * If not provided, test events are acknowledged with a success response.
    */
-  onTestPing?: (payload: WebhookPayload<"test.ping">) => Promise<void> | void;
+  onTestPing?: (
+    payload: WebhookPayload<"test.ping">,
+    context: WebhookContext,
+  ) => Promise<void> | void;
 
   /**
    * Generic handler for all events (called after specific handlers)
@@ -161,12 +349,23 @@ export interface WebhookConfig {
   onEvent?: (
     eventType: WebhookEventType,
     payload: WebhookPayload,
+    context: WebhookContext,
   ) => Promise<void> | void;
 
   /**
-   * Error handler for when webhook processing fails
+   * Error handler for when webhook processing fails.
+   *
+   * Return a `WebhookErrorOverride` (or a Promise of one) to override
+   * the default 500 response — for example, return `{ statusCode:
+   * 200 }` to ack-and-drop a poison message, or `{ statusCode: 400 }`
+   * to permanently reject it (MuseRank will not retry on 4xx).
+   *
+   * Returning `void` keeps the default behavior.
    */
-  onError?: (error: Error, payload?: WebhookPayload) => Promise<void> | void;
+  onError?: (
+    error: Error,
+    payload?: WebhookPayload,
+  ) => Promise<WebhookErrorOverride | void> | WebhookErrorOverride | void;
 
   /**
    * Enable debug logging
@@ -201,12 +400,44 @@ export class WebhookVerificationError extends Error {
  * Error thrown when webhook processing fails
  */
 export class WebhookProcessingError extends Error {
+  /**
+   * Optional override returned by `onError` for adapter consumption.
+   * Adapters (`/web`, `/nextjs`, `/express`) read this to decide the
+   * outgoing HTTP response. End users should rarely interact with it
+   * directly.
+   */
+  override?: WebhookErrorOverride;
+
   constructor(
     message: string,
     public payload?: WebhookPayload,
+    override?: WebhookErrorOverride,
   ) {
     super(message);
     this.name = "WebhookProcessingError";
+    this.override = override;
+  }
+}
+
+/**
+ * Error thrown when a handler exceeds `handlerTimeoutMs`.
+ *
+ * Thin subclass of `WebhookProcessingError` so existing 500-mapping
+ * code keeps working, while `instanceof` callers can distinguish a
+ * timeout from an arbitrary handler bug.
+ */
+export class WebhookHandlerTimeoutError extends WebhookProcessingError {
+  /** Timeout that was exceeded, in milliseconds. */
+  timeoutMs: number;
+
+  constructor(timeoutMs: number, payload?: WebhookPayload) {
+    super(
+      `Webhook handler exceeded ${timeoutMs}ms timeout`,
+      payload,
+      /* override */ undefined,
+    );
+    this.name = "WebhookHandlerTimeoutError";
+    this.timeoutMs = timeoutMs;
   }
 }
 
@@ -219,6 +450,23 @@ export class WebhookProcessingError extends Error {
  */
 export function isWebhookEventType(value: unknown): value is WebhookEventType {
   return typeof value === "string" && WEBHOOK_EVENT_TYPE_SET.has(value);
+}
+
+/**
+ * Validate that a value is a non-empty string of printable ASCII
+ * characters without whitespace (chars 0x21–0x7E), capped at 255
+ * chars. Used for `event_id` and `delivery_id`, both of which the
+ * dispatcher generates as opaque tokens and which MUST be safe to
+ * stuff into URL paths, HTTP headers, log lines and SQL UNIQUE
+ * columns without any extra escaping.
+ */
+function isOpaqueId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 255 &&
+    /^[\x21-\x7e]+$/.test(value)
+  );
 }
 
 /**
@@ -301,12 +549,17 @@ async function computeHmacSha256Hex(
 }
 
 /**
- * Verify the webhook signature using HMAC-SHA256
+ * Verify the webhook signature using HMAC-SHA256.
+ *
+ * Accepts a single secret or a list of secrets — useful during
+ * zero-downtime rotation, where both the new and old secret are
+ * accepted briefly. Each candidate is checked with constant-time
+ * comparison.
  */
 export async function verifySignature(
   payload: string,
   signature: string,
-  secret: string,
+  secret: string | readonly string[],
 ): Promise<boolean> {
   const normalizedSignature = signature
     .trim()
@@ -318,21 +571,38 @@ export async function verifySignature(
     return false;
   }
 
-  try {
-    const expectedSignature = await computeHmacSha256Hex(payload, secret);
-    const expectedSignatureBytes = hexToBytes(expectedSignature);
+  const candidates = Array.isArray(secret) ? secret : [secret as string];
 
-    if (!expectedSignatureBytes) {
-      return false;
+  // Iterate every secret regardless of an early match so the loop
+  // runtime doesn't leak how many secrets were configured. We OR the
+  // results into `matched` and only act on it after all candidates
+  // have been compared.
+  let matched = false;
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string" || candidate.length === 0) {
+      continue;
     }
 
-    return constantTimeEqualBytes(
-      expectedSignatureBytes,
-      providedSignatureBytes,
-    );
-  } catch {
-    return false;
+    try {
+      const expectedSignature = await computeHmacSha256Hex(payload, candidate);
+      const expectedSignatureBytes = hexToBytes(expectedSignature);
+
+      if (!expectedSignatureBytes) {
+        continue;
+      }
+
+      if (
+        constantTimeEqualBytes(expectedSignatureBytes, providedSignatureBytes)
+      ) {
+        matched = true;
+      }
+    } catch {
+      // Swallow per-secret errors so a single bad secret can't drop
+      // the whole verification path.
+    }
   }
+
+  return matched;
 }
 
 /**
@@ -462,6 +732,8 @@ export function parseWebhookPayload(body: string | object): WebhookPayload {
   }
 
   const candidatePayload = payload as {
+    event_id?: unknown;
+    delivery_id?: unknown;
     event_type?: unknown;
     timestamp?: unknown;
     data?: {
@@ -472,6 +744,23 @@ export function parseWebhookPayload(body: string | object): WebhookPayload {
   if (!isWebhookEventType(candidatePayload.event_type)) {
     throw new WebhookVerificationError(
       "Unsupported or missing event_type in payload",
+      400,
+    );
+  }
+
+  if (!isOpaqueId(candidatePayload.event_id)) {
+    throw new WebhookVerificationError(
+      "Missing or invalid event_id in payload",
+      400,
+    );
+  }
+
+  if (
+    candidatePayload.delivery_id !== undefined &&
+    !isOpaqueId(candidatePayload.delivery_id)
+  ) {
+    throw new WebhookVerificationError(
+      "Invalid delivery_id in payload",
       400,
     );
   }
@@ -507,6 +796,103 @@ export function parseWebhookPayload(body: string | object): WebhookPayload {
 }
 
 /**
+ * Race a promise against an `AbortSignal`-driven timeout.
+ *
+ * Resolves/rejects with whichever finishes first; cleans up the timer
+ * either way. The signal MUST already be wired to the timeout — we
+ * don't create the AbortController here so callers can share one
+ * across multiple races (i.e. abort all handler timeouts on first
+ * failure if we ever want to add fail-fast behavior).
+ */
+function raceWithSignal<T>(
+  promise: Promise<T>,
+  signal: AbortSignal,
+  onAbort: () => Error,
+): Promise<T> {
+  if (signal.aborted) {
+    return Promise.reject(onAbort());
+  }
+  return new Promise<T>((resolve, reject) => {
+    const handleAbort = () => {
+      signal.removeEventListener("abort", handleAbort);
+      reject(onAbort());
+    };
+    signal.addEventListener("abort", handleAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", handleAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", handleAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+/**
+ * Build a fresh `WebhookContext` for a single handler invocation.
+ *
+ * Each handler call gets its own AbortController so a slow handler
+ * for article #2 can't abort the timer that's about to fire for
+ * article #3 (and vice-versa).
+ */
+function createHandlerContext(
+  payload: WebhookPayload,
+  handlerTimeoutMs: number,
+): { context: WebhookContext; clear: () => void } {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  if (handlerTimeoutMs > 0) {
+    timer = setTimeout(() => {
+      controller.abort();
+    }, handlerTimeoutMs);
+  }
+  return {
+    context: {
+      eventId: payload.event_id,
+      deliveryId: payload.delivery_id,
+      signal: controller.signal,
+    },
+    clear: () => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    },
+  };
+}
+
+/**
+ * Run a single handler invocation under the configured timeout.
+ *
+ * `runner` is a thunk so we can keep the handler-specific casts
+ * (`onArticlePublished` vs `onTestPing` etc.) at the call site, while
+ * the timer + abort plumbing lives here exactly once.
+ */
+async function runUnderTimeout(
+  payload: WebhookPayload,
+  handlerTimeoutMs: number,
+  runner: (context: WebhookContext) => Promise<void> | void,
+): Promise<void> {
+  const { context, clear } = createHandlerContext(payload, handlerTimeoutMs);
+  try {
+    if (handlerTimeoutMs <= 0) {
+      await runner(context);
+      return;
+    }
+    await raceWithSignal(
+      Promise.resolve().then(() => runner(context)),
+      context.signal,
+      () => new WebhookHandlerTimeoutError(handlerTimeoutMs, payload),
+    );
+  } finally {
+    clear();
+  }
+}
+
+/**
  * Process a webhook event with the configured handlers
  */
 export async function processWebhookEvent(
@@ -515,9 +901,17 @@ export async function processWebhookEvent(
 ): Promise<WebhookResult> {
   const { event_type, data } = payload;
   const articles = data?.articles || [];
+  const handlerTimeoutMs =
+    config.handlerTimeoutMs ?? DEFAULT_HANDLER_TIMEOUT_MS;
+
+  if (handlerTimeoutMs < 0) {
+    throw new Error("handlerTimeoutMs must be >= 0");
+  }
 
   if (config.debug) {
-    console.log(`[MuseRank Webhook] Processing ${event_type} event`);
+    console.log(
+      `[MuseRank Webhook] Processing ${event_type} event (event_id=${payload.event_id})`,
+    );
   }
 
   try {
@@ -526,9 +920,12 @@ export async function processWebhookEvent(
       case "article.published":
         if (config.onArticlePublished) {
           for (const article of articles) {
-            await config.onArticlePublished(
-              article,
-              payload as WebhookPayload<"article.published">,
+            await runUnderTimeout(payload, handlerTimeoutMs, (ctx) =>
+              config.onArticlePublished!(
+                article,
+                payload as WebhookPayload<"article.published">,
+                ctx,
+              ),
             );
           }
         }
@@ -537,9 +934,12 @@ export async function processWebhookEvent(
       case "article.updated":
         if (config.onArticleUpdated) {
           for (const article of articles) {
-            await config.onArticleUpdated(
-              article,
-              payload as WebhookPayload<"article.updated">,
+            await runUnderTimeout(payload, handlerTimeoutMs, (ctx) =>
+              config.onArticleUpdated!(
+                article,
+                payload as WebhookPayload<"article.updated">,
+                ctx,
+              ),
             );
           }
         }
@@ -548,9 +948,12 @@ export async function processWebhookEvent(
       case "article.scheduled":
         if (config.onArticleScheduled) {
           for (const article of articles) {
-            await config.onArticleScheduled(
-              article,
-              payload as WebhookPayload<"article.scheduled">,
+            await runUnderTimeout(payload, handlerTimeoutMs, (ctx) =>
+              config.onArticleScheduled!(
+                article,
+                payload as WebhookPayload<"article.scheduled">,
+                ctx,
+              ),
             );
           }
         }
@@ -559,9 +962,12 @@ export async function processWebhookEvent(
       case "article.failed":
         if (config.onArticleFailed) {
           for (const article of articles) {
-            await config.onArticleFailed(
-              article,
-              payload as WebhookPayload<"article.failed">,
+            await runUnderTimeout(payload, handlerTimeoutMs, (ctx) =>
+              config.onArticleFailed!(
+                article,
+                payload as WebhookPayload<"article.failed">,
+                ctx,
+              ),
             );
           }
         }
@@ -569,7 +975,9 @@ export async function processWebhookEvent(
 
       case "test.ping":
         if (config.onTestPing) {
-          await config.onTestPing(payload as WebhookPayload<"test.ping">);
+          await runUnderTimeout(payload, handlerTimeoutMs, (ctx) =>
+            config.onTestPing!(payload as WebhookPayload<"test.ping">, ctx),
+          );
         } else if (config.debug) {
           // Log test ping even without handler
           console.log(
@@ -587,7 +995,9 @@ export async function processWebhookEvent(
 
     // Call generic handler
     if (config.onEvent) {
-      await config.onEvent(event_type, payload);
+      await runUnderTimeout(payload, handlerTimeoutMs, (ctx) =>
+        config.onEvent!(event_type, payload, ctx),
+      );
     }
 
     return {
@@ -599,11 +1009,54 @@ export async function processWebhookEvent(
   } catch (error) {
     const err = error instanceof Error ? error : new Error(String(error));
 
+    let override: WebhookErrorOverride | undefined;
     if (config.onError) {
-      await config.onError(err, payload);
+      try {
+        const result = await config.onError(err, payload);
+        if (
+          result &&
+          typeof result === "object" &&
+          typeof (result as { statusCode?: unknown }).statusCode === "number"
+        ) {
+          const candidate = result as WebhookErrorOverride;
+          if (
+            Number.isInteger(candidate.statusCode) &&
+            candidate.statusCode >= 200 &&
+            candidate.statusCode <= 599
+          ) {
+            override = candidate;
+          } else {
+            // Invalid override would either crash the adapter
+            // (Response.json throws RangeError outside [200, 599], Node
+            // throws on NaN status) or produce a malformed response.
+            // Fall back to the default 500 path and surface the
+            // misconfiguration loudly so it's visible in logs.
+            console.warn(
+              `[MuseRank Webhook] onError returned invalid statusCode=${String(candidate.statusCode)}; ` +
+                "expected an integer in [200, 599]. Falling back to default 500 response.",
+            );
+          }
+        }
+      } catch (onErrorError) {
+        // Don't let a buggy onError mask the real handler error.
+        if (config.debug) {
+          console.error(
+            "[MuseRank Webhook] onError handler itself threw:",
+            onErrorError,
+          );
+        }
+      }
     }
 
-    throw new WebhookProcessingError(err.message, payload);
+    // Preserve the original timeout sub-class so adapters can map it
+    // back to a 500 (or whatever the override says) without losing
+    // its `instanceof WebhookHandlerTimeoutError` identity.
+    if (err instanceof WebhookHandlerTimeoutError) {
+      err.payload = payload;
+      err.override = override;
+      throw err;
+    }
+    throw new WebhookProcessingError(err.message, payload, override);
   }
 }
 
@@ -630,6 +1083,32 @@ export function createWebhookHandler(config: WebhookConfig) {
 
   if (timestampToleranceMs < 0) {
     throw new Error("timestampToleranceMs must be >= 0");
+  }
+
+  const handlerTimeoutMs =
+    config.handlerTimeoutMs ?? DEFAULT_HANDLER_TIMEOUT_MS;
+
+  if (handlerTimeoutMs < 0) {
+    throw new Error("handlerTimeoutMs must be >= 0");
+  }
+
+  if (config.signingSecret !== undefined && Array.isArray(config.signingSecret)) {
+    if (config.signingSecret.length === 0) {
+      throw new Error(
+        "signingSecret array must not be empty. Pass `undefined` to disable " +
+          "signature verification, or include at least one non-empty secret string.",
+      );
+    }
+    const hasUsableSecret = config.signingSecret.some(
+      (secret) => typeof secret === "string" && secret.length > 0,
+    );
+    if (!hasUsableSecret) {
+      throw new Error(
+        "signingSecret array must contain at least one non-empty string. " +
+          "All entries are empty or non-string, which would make every " +
+          "request fail with 401 Invalid signature.",
+      );
+    }
   }
 
   return async (request: {

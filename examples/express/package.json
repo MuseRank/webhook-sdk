@@ -1,0 +1,20 @@
+{
+  "name": "muserank-webhook-example-express",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts"
+  },
+  "dependencies": {
+    "@muserank/webhook-sdk": "workspace:*",
+    "express": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.3.1",
+    "tsx": "^4.22.0",
+    "typescript": "^5.9.3"
+  }
+}

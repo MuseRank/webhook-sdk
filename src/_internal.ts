@@ -4,7 +4,33 @@
  * Not part of the public API.
  */
 
-import { assertBodySizeLimit, WebhookVerificationError } from "./index";
+import {
+  assertBodySizeLimit,
+  verifyBearerToken,
+  WebhookVerificationError,
+} from "./index";
+
+// ============================================================================
+// PRE-BODY AUTHORIZATION
+// ============================================================================
+
+/**
+ * Reject a request whose `Authorization` header does not carry the
+ * configured bearer token, BEFORE its body is read.
+ *
+ * Adapters call this ahead of buffering so an unauthenticated client
+ * cannot make the SDK hold up to `maxBodySizeBytes` in memory. The core
+ * handler repeats the same check, so this only changes ordering: the
+ * request is rejected with the same 401 either way.
+ */
+export function assertAuthorizedBeforeBody(
+  headers: Record<string, string | undefined>,
+  accessToken: string,
+): void {
+  if (!verifyBearerToken(headers["authorization"], accessToken)) {
+    throw new WebhookVerificationError("Invalid or missing authorization", 401);
+  }
+}
 
 // ============================================================================
 // TYPES

@@ -19,7 +19,10 @@ import {
   WebhookProcessingError,
 } from "./index";
 import type { WebhookConfig } from "./index";
-import { readFetchBodyWithLimit } from "./_internal";
+import {
+  assertAuthorizedBeforeBody,
+  readFetchBodyWithLimit,
+} from "./_internal";
 
 export * from "./index";
 
@@ -131,14 +134,17 @@ export function createMuseRankWebhook(config: WebhookConfig) {
     }
 
     try {
-      // Parse request body (preserves raw bytes for signature verification)
-      const body = await readFetchBodyWithLimit(request, maxBodySizeBytes);
-
       // Get headers as a plain object
       const headers: Record<string, string | undefined> = {};
       request.headers.forEach((value, key) => {
         headers[key.toLowerCase()] = value;
       });
+
+      // Reject unauthenticated requests before buffering the body
+      assertAuthorizedBeforeBody(headers, config.accessToken);
+
+      // Parse request body (preserves raw bytes for signature verification)
+      const body = await readFetchBodyWithLimit(request, maxBodySizeBytes);
 
       // Process webhook
       const result = await handler({
@@ -162,10 +168,16 @@ export function createMuseRankWebhook(config: WebhookConfig) {
       }
 
       if (error instanceof WebhookProcessingError) {
+        const override = error.override;
+        const status = override?.statusCode ?? 500;
+        const success = override?.success ?? status < 400;
+        const message = override?.message ?? error.message;
         return new Response(
-          JSON.stringify({ success: false, error: error.message }),
+          JSON.stringify(
+            success ? { success: true, message } : { success: false, error: message },
+          ),
           {
-            status: 500,
+            status,
             headers: { "Content-Type": "application/json" },
           },
         );
