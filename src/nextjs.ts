@@ -13,6 +13,7 @@ import {
 } from "./index";
 import type { WebhookConfig } from "./index";
 import {
+  assertAuthorizedBeforeBody,
   enforceBodyStringLimit,
   enforceBodyObjectLimit,
   readFetchBodyWithLimit,
@@ -63,14 +64,17 @@ export function createMuseRankWebhook(config: WebhookConfig) {
     }
 
     try {
-      // Parse request body
-      const body = await readFetchBodyWithLimit(request, maxBodySizeBytes);
-
       // Get headers
       const headers: Record<string, string | undefined> = {};
       request.headers.forEach((value, key) => {
         headers[key.toLowerCase()] = value;
       });
+
+      // Reject unauthenticated requests before buffering the body
+      assertAuthorizedBeforeBody(headers, config.accessToken);
+
+      // Parse request body
+      const body = await readFetchBodyWithLimit(request, maxBodySizeBytes);
 
       // Process webhook
       const result = await handler({
@@ -155,6 +159,9 @@ export function createMuseRankPagesWebhook(config: WebhookConfig) {
       for (const [key, value] of Object.entries(req.headers)) {
         headers[key.toLowerCase()] = Array.isArray(value) ? value[0] : value;
       }
+
+      // Reject unauthenticated requests before reading the raw stream
+      assertAuthorizedBeforeBody(headers, config.accessToken);
 
       // Get body (may need to read from raw stream if bodyParser is disabled)
       let body: string | object;

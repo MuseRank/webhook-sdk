@@ -69,9 +69,9 @@
         "content_markdown": { "type": "string", "description": "Markdown form of the article. Empty string when the article has no content yet." },
         "content_html":     { "type": "string", "description": "Raw editor HTML, exactly as authored in MuseRank." },
         "meta_description": { "type": "string", "description": "SEO meta description. Empty string when none was set." },
-        "created_at":       { "type": "string", "format": "date-time", "description": "ISO 8601 timestamp of article creation." },
+        "created_at":       { "type": "string", "format": "date-time", "description": "ISO 8601 timestamp of article creation in MuseRank. Not the publish time." },
         "image_url":        { "type": "string", "description": "Featured image URL. Empty string when none was set." },
-        "slug":             { "type": "string", "description": "URL-friendly slug derived from the article title." },
+        "slug":             { "type": "string", "description": "URL-friendly slug derived from the editorial title (not the SEO title). Changes when that title changes; key records on id." },
         "tags": {
           "type": "array",
           "items": { "type": "string", "minLength": 1 },

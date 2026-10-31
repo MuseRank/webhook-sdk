@@ -12,6 +12,7 @@ import {
 } from "./index";
 import type { WebhookConfig } from "./index";
 import {
+  assertAuthorizedBeforeBody,
   enforceBodyStringLimit,
   enforceBodyObjectLimit,
   readNodeBodyWithLimit,
@@ -57,7 +58,8 @@ type ExpressNext = (error?: Error) => void;
  * import { createMuseRankWebhook } from '@muserank/webhook-sdk/express';
  *
  * const app = express();
- * app.use(express.json());
+ * // express.json() defaults to a 100kb limit; MuseRank articles are larger.
+ * app.use(express.json({ limit: '5mb' }));
  *
  * app.post('/api/webhooks/muserank', createMuseRankWebhook({
  *   accessToken: process.env.MUSERANK_WEBHOOK_TOKEN!,
@@ -90,7 +92,7 @@ type ExpressNext = (error?: Error) => void;
  * } from '@muserank/webhook-sdk/express';
  *
  * const app = express();
- * app.use(express.json({ verify: createRawBodyVerifier() }));
+ * app.use(express.json({ limit: '5mb', verify: createRawBodyVerifier() }));
  *
  * app.post('/api/webhooks/muserank', createMuseRankWebhook({
  *   accessToken: process.env.MUSERANK_WEBHOOK_TOKEN!,
@@ -127,6 +129,9 @@ export function createMuseRankWebhook(config: WebhookConfig) {
       for (const [key, value] of Object.entries(req.headers)) {
         headers[key.toLowerCase()] = Array.isArray(value) ? value[0] : value;
       }
+
+      // Reject unauthenticated requests before reading the raw stream
+      assertAuthorizedBeforeBody(headers, config.accessToken);
 
       // Get body
       let body: string | object;
@@ -219,8 +224,8 @@ type ExpressJsonVerify = (
  * app.post(
  *   '/api/webhooks/muserank',
  *   express.json({
- *     limit: '2mb',
- *     verify: createRawBodyVerifier({ maxBodySizeBytes: 2 * 1024 * 1024 }),
+ *     limit: '5mb',
+ *     verify: createRawBodyVerifier({ maxBodySizeBytes: 5 * 1024 * 1024 }),
  *   }),
  *   createMuseRankWebhook({
  *     accessToken: process.env.MUSERANK_WEBHOOK_TOKEN!,
@@ -268,7 +273,7 @@ export function createRawBodyVerifier(
  *
  * app.post(
  *   '/api/webhooks/muserank',
- *   rawBodyMiddleware({ maxBodySizeBytes: 2 * 1024 * 1024 }),
+ *   rawBodyMiddleware({ maxBodySizeBytes: 5 * 1024 * 1024 }),
  *   createMuseRankWebhook({
  *     accessToken: process.env.MUSERANK_WEBHOOK_TOKEN!,
  *     signingSecret: process.env.MUSERANK_SIGNING_SECRET,

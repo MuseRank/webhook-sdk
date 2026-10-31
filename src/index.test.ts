@@ -14,6 +14,7 @@ import {
   WebhookProcessingError,
   WebhookVerificationError,
   DEFAULT_HANDLER_TIMEOUT_MS,
+  MUSERANK_DELIVERY_TIMEOUT_MS,
   DEFAULT_TIMESTAMP_TOLERANCE_MS,
   CLOCK_SKEW_TOLERANCE_MS,
 } from "./index";
@@ -641,8 +642,9 @@ describe("handlerTimeoutMs", () => {
     );
   });
 
-  it("DEFAULT_HANDLER_TIMEOUT_MS is 30s", () => {
-    expect(DEFAULT_HANDLER_TIMEOUT_MS).toBe(30_000);
+  it("DEFAULT_HANDLER_TIMEOUT_MS is 25s, below MuseRank's 30s delivery timeout", () => {
+    expect(DEFAULT_HANDLER_TIMEOUT_MS).toBe(25_000);
+    expect(DEFAULT_HANDLER_TIMEOUT_MS).toBeLessThan(MUSERANK_DELIVERY_TIMEOUT_MS);
   });
 
   it("each article in a batch gets its own timer (no shared budget)", async () => {

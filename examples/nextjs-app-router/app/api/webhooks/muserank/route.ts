@@ -1,42 +1,54 @@
 import { createMuseRankWebhook } from "@muserank/webhook-sdk/nextjs";
 
-import { claimEvent } from "../../../../lib/idempotency";
+import { claimEvent, releaseEvent } from "../../../../lib/idempotency";
 
-// Comma-separated form lets you keep the previous secret valid during
-// a rotation window without redeploying. Empty entries are ignored by
-// the SDK, so the trailing-comma case is safe.
+// Comma-separated form lets you deploy `new,old` right after rotating
+// the secret in MuseRank. Empty entries are ignored by the SDK, so the
+// trailing-comma case is safe.
 const signingSecret = (process.env.MUSERANK_SIGNING_SECRET ?? "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
+/**
+ * Run `work` once per `event_id`. A failure releases the claim so
+ * MuseRank's retry (same `event_id`) is processed, not skipped.
+ */
+async function once(eventId: string, work: () => Promise<void>) {
+  if (!claimEvent(eventId)) {
+    console.log(`[muserank] skipping retry for ${eventId} (already processed)`);
+    return;
+  }
+  try {
+    await work();
+  } catch (error) {
+    releaseEvent(eventId);
+    throw error;
+  }
+}
+
 export const POST = createMuseRankWebhook({
   accessToken: process.env.MUSERANK_WEBHOOK_TOKEN!,
   signingSecret: signingSecret.length > 1 ? signingSecret : signingSecret[0],
 
-  // 10 seconds is plenty for an upsert into your CMS. The default 30s
-  // is safer if you're synchronously rebuilding indexes; tune to your
-  // own infra.
+  // 10 seconds is plenty for an upsert into your CMS. The default 25s
+  // (just under MuseRank's 30s delivery timeout) is safer if you're
+  // synchronously rebuilding indexes; tune to your own infra.
   handlerTimeoutMs: 10_000,
 
-  onArticlePublished: async (article, payload, ctx) => {
-    if (!claimEvent(ctx.eventId)) {
+  onArticlePublished: (article, _payload, ctx) =>
+    once(ctx.eventId, async () => {
       console.log(
-        `[muserank] skipping retry for ${ctx.eventId} (already processed)`,
+        `[muserank] article.published id=${article.id} title=${JSON.stringify(article.title)} delivery=${ctx.deliveryId ?? "n/a"}`,
       );
-      return;
-    }
-    console.log(
-      `[muserank] article.published id=${article.id} title=${JSON.stringify(article.title)} delivery=${ctx.deliveryId ?? "n/a"}`,
-    );
-    // TODO: replace with your real upsert, e.g.:
-    //   await prisma.article.upsert({ where: { externalId: article.id }, ... });
-  },
+      // TODO: replace with your real upsert, e.g.:
+      //   await prisma.article.upsert({ where: { externalId: article.id }, ... });
+    }),
 
-  onArticleUpdated: async (article, _payload, ctx) => {
-    if (!claimEvent(ctx.eventId)) return;
-    console.log(`[muserank] article.updated id=${article.id}`);
-  },
+  onArticleUpdated: (article, _payload, ctx) =>
+    once(ctx.eventId, async () => {
+      console.log(`[muserank] article.updated id=${article.id}`);
+    }),
 
   onTestPing: async (_payload, ctx) => {
     console.log(`[muserank] test.ping received (event_id=${ctx.eventId})`);

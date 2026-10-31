@@ -5,7 +5,7 @@ Official SDK for receiving MuseRank webhook events in your application. Easily i
 ## Features
 
 - **Idempotency built-in** — every event carries a stable `event_id`; use it as your `UNIQUE` constraint
-- **HMAC signing with zero-downtime rotation** — `signingSecret` accepts an array, every secret is tried in constant time
+- **HMAC signing** — `signingSecret` accepts an array (for rotation), every secret is tried in constant time
 - **Per-handler timeouts** — slow handlers are aborted via `AbortSignal` so MuseRank can back off and retry
 - **Structured error overrides** — `onError` can return a custom HTTP status to ack-and-drop poison messages instead of looping retries
 - **Universal** — Next.js, Remix, Astro, SvelteKit, Express, Cloudflare Workers, Deno, Bun
@@ -34,17 +34,21 @@ export const POST = createMuseRankWebhook({
   accessToken: process.env.MUSERANK_WEBHOOK_TOKEN!,
   
   onArticlePublished: async (article) => {
-    await prisma.article.create({
-      data: {
-        externalId: article.id,
-        title: article.title,
-        content: article.content_html,
-        slug: article.slug,
-        metaDescription: article.meta_description,
-        featuredImage: article.image_url,
-        tags: article.tags,
-        publishedAt: new Date(article.created_at),
-      },
+    // Upsert, not create: MuseRank retries failed deliveries, so the
+    // same article can arrive more than once.
+    const data = {
+      title: article.title,
+      content: article.content_html,
+      slug: article.slug,
+      metaDescription: article.meta_description,
+      featuredImage: article.image_url,
+      tags: article.tags,
+      createdAt: new Date(article.created_at), // creation time, not publish time
+    };
+    await prisma.article.upsert({
+      where: { externalId: article.id },
+      create: { externalId: article.id, ...data },
+      update: data,
     });
   },
 
@@ -126,7 +130,9 @@ import express from 'express';
 import { createMuseRankWebhook } from '@muserank/webhook-sdk/express';
 
 const app = express();
-app.use(express.json());
+// express.json() defaults to a 100kb limit. MuseRank sends long articles
+// as HTML plus Markdown, so raise it to match the SDK's 5MB default.
+app.use(express.json({ limit: '5mb' }));
 
 app.post('/api/webhooks/muserank', createMuseRankWebhook({
   accessToken: process.env.MUSERANK_WEBHOOK_TOKEN!,
@@ -192,19 +198,20 @@ interface WebhookConfig {
   accessToken: string;
 
   // Optional: Signing secret for HMAC verification.
-  // Pass an array during a rotation window — the SDK tries every entry,
-  // so both old-and-new secrets verify until you drop the old one.
+  // Pass an array to accept several secrets (e.g. `[new, old]` right after
+  // rotating in MuseRank) — the SDK tries every entry.
   signingSecret?: string | readonly string[];
 
   // Optional: Timestamp tolerance for replay attack protection (default: 5 minutes)
   // Set to 0 to disable timestamp verification
   timestampToleranceMs?: number;
 
-  // Optional: Max accepted payload size in bytes (default: 1MB)
-  // Set to 0 to disable size checks
+  // Optional: Max accepted payload size in bytes (default: 5MB, sized for
+  // MuseRank's largest articles). Set to 0 to disable size checks
   maxBodySizeBytes?: number;
 
-  // Optional: Per-handler timeout in milliseconds (default: 30s).
+  // Optional: Per-handler timeout in milliseconds (default: 25s, just under
+  // MuseRank's 30s delivery timeout).
   // The handler's `context.signal` is aborted when this elapses.
   // Set to 0 to disable.
   handlerTimeoutMs?: number;
@@ -238,11 +245,15 @@ interface WebhookConfig {
 
 | Event | Description |
 |-------|-------------|
-| `article.published` | Article was successfully published |
-| `article.updated` | Published article was updated |
+| `article.published` | Article was published for the first time |
+| `article.updated` | An already-published article was published again (for example after edits). Saving edits alone does not send this event. |
 | `article.scheduled` | Article was scheduled for publishing |
-| `article.failed` | Article publishing failed |
-| `test.ping` | Test event from MuseRank dashboard |
+| `article.failed` | A publish attempt for the article failed |
+| `test.ping` | **Test** button in the MuseRank dashboard. `data.articles` is empty. |
+
+You choose which article events to receive when you connect the webhook in
+MuseRank. `test.ping` is always sent when you press **Test**; without an
+`onTestPing` handler the SDK acknowledges it with `200`.
 
 ## Article Payload
 
@@ -255,9 +266,9 @@ interface WebhookArticle {
   content_markdown: string; // Content as Markdown (converted from the editor's HTML)
   content_html: string;     // Content as raw HTML (exactly as edited in MuseRank)
   meta_description: string; // SEO meta description
-  created_at: string;       // ISO 8601 timestamp
+  created_at: string;       // ISO 8601 creation time in MuseRank (not the publish time)
   image_url: string;        // Featured image URL ("" when none set)
-  slug: string;             // URL-friendly slug
+  slug: string;             // Slug of the editorial title (key records on `id`, not `slug`)
   tags: string[];           // [primary keyword, focus keyphrase, ...topical-map siblings]
 }
 ```
@@ -281,23 +292,56 @@ interface WebhookPayload {
 }
 ```
 
-MuseRank retries failed deliveries (5xx and timeouts) up to 3 times with
-exponential backoff. The `event_id` stays the same on every retry, so the
-production-recommended pattern is:
+### How MuseRank delivers
+
+| Your response | What MuseRank does |
+|---------------|--------------------|
+| `2xx` | Delivered. |
+| `5xx`, `408`, `429`, network error, or no response within **30 seconds** | Retries with exponential backoff: up to 8 attempts, starting at 30s and doubling (about an hour in total). |
+| Any other `4xx` (including the SDK's `400`, `401`, `413`) | Permanent failure. Not retried. |
+
+Each attempt is signed again and carries a fresh `timestamp` and
+`delivery_id`, so retries pass the SDK's replay window. MuseRank does not
+follow redirects, so register the final URL. When the webhook is the
+article's publishing destination (rather than a notification alongside
+another destination), a failed delivery fails that publish job, which
+follows the publishing queue's retry schedule instead. After **10
+consecutive failed deliveries** MuseRank disables the webhook; saving the
+webhook settings or a successful **Test** re-enables it.
+
+The `event_id` stays the same on every retry, so the
+production-recommended pattern is to claim the event and do the work in
+**one transaction**. If the work fails, the rollback releases the claim and
+MuseRank's retry is processed. A claim committed before the work would make
+that retry look like a duplicate, and the event would be lost:
 
 ```typescript
 onArticlePublished: async (article, _payload, ctx) => {
-  // Race-safe atomic claim. If another worker already processed this
-  // event, the INSERT does nothing and we ack-and-drop.
-  const { rowCount } = await db.query(
-    `INSERT INTO processed_webhook_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING`,
-    [ctx.eventId],
-  );
-  if (rowCount === 0) return;
+  await db.transaction(async (tx) => {
+    // Race-safe atomic claim. If another request already processed this
+    // event, the INSERT does nothing and we ack-and-drop.
+    const { rowCount } = await tx.query(
+      `INSERT INTO processed_webhook_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING`,
+      [ctx.eventId],
+    );
+    if (rowCount === 0) return;
 
-  await db.article.upsert({ ... });
+    await tx.article.upsert({ ... });
+  });
 }
 ```
+
+### Headers MuseRank sends
+
+| Header | Value |
+|--------|-------|
+| `Authorization` | `Bearer <access token>` — the token you entered in MuseRank. Verified by the SDK. |
+| `X-MuseRank-Signature` | `sha256=<hex>` HMAC-SHA256 of the raw body. Sent when a signing secret exists. Verified by the SDK when you set `signingSecret`. |
+| `X-MuseRank-Signature-V2` | `sha256=<hex>` HMAC-SHA256 of `` `${X-MuseRank-Timestamp}.${rawBody}` ``. For receivers that check freshness before parsing JSON. The SDK does not need it: the body `timestamp` it checks is already covered by `X-MuseRank-Signature`. |
+| `X-MuseRank-Timestamp` | Send time in Unix milliseconds (pairs with `X-MuseRank-Signature-V2`). |
+| `X-MuseRank-Event-ID` | Same as `payload.event_id`. |
+| `X-MuseRank-Delivery-ID` | Same as `payload.delivery_id`. |
+| `X-Webhook-Event` | Same as `payload.event_type`. |
 
 A non-TypeScript consumer can validate payloads against the JSON Schema we
 ship at the package root:
@@ -306,14 +350,15 @@ ship at the package root:
 node -e "console.log(require('@muserank/webhook-sdk/payload.schema.json').$id)"
 ```
 
-The schema is regenerated against `WebhookPayload` on every CI run, so it
-never drifts.
+CI checks the schema against `WebhookPayload` on every run, so the two
+cannot drift apart unnoticed.
 
 ## Handler timeouts
 
 Long-running handlers block MuseRank's outbound request and waste retry
-budget. The SDK enforces a per-handler timeout (default 30 seconds) and
-exposes the abort signal via `context.signal`:
+budget. MuseRank waits 30 seconds per attempt; the SDK enforces a
+per-handler timeout (default 25 seconds, so it answers first) and exposes
+the abort signal via `context.signal`:
 
 ```typescript
 onArticlePublished: async (article, _payload, ctx) => {
@@ -389,31 +434,37 @@ createMuseRankWebhook({
 
 The SDK will verify the `X-MuseRank-Signature` header (format: `sha256=<lowercase hex>`) against an HMAC-SHA256 of the **raw** request body using your `signingSecret`. Signature comparison is constant-time.
 
-**Zero-downtime rotation**
+**Rotating the secret**
 
-`signingSecret` accepts an array; every entry is tried (in constant
-time, so the loop runtime doesn't leak how many secrets you have).
-During a rotation deploy, ship the new secret first and keep the
-previous one in second position:
+**Rotate** in MuseRank takes effect immediately: every delivery after that,
+including retries of older events, is signed with the new secret. Until your
+endpoint has the new secret, those deliveries fail with `401` and are not
+retried. Keep that window short:
 
-```typescript
-createMuseRankWebhook({
-  accessToken: process.env.MUSERANK_WEBHOOK_TOKEN!,
-  signingSecret: [
-    process.env.MUSERANK_SIGNING_SECRET_NEW!, // matches new dispatcher
-    process.env.MUSERANK_SIGNING_SECRET_OLD!, // matches in-flight requests
-  ],
-});
-```
+1. Have your deploy ready, then press **Rotate** and copy the new secret.
+2. Deploy right away with both secrets (`signingSecret` accepts an array and
+   tries every entry in constant time):
 
-Once you're confident no in-flight request still uses the old secret,
-drop it on the next deploy.
+   ```typescript
+   createMuseRankWebhook({
+     accessToken: process.env.MUSERANK_WEBHOOK_TOKEN!,
+     signingSecret: [
+       process.env.MUSERANK_SIGNING_SECRET_NEW!, // everything sent after the rotation
+       process.env.MUSERANK_SIGNING_SECRET_OLD!, // requests already in flight
+     ],
+   });
+   ```
+
+3. Drop the old secret on your next deploy.
+
+If articles were published during the window, republish them or check the
+webhook status in MuseRank.
 
 **How to get the signing secret:**
 
 1. Open **Integrations → Webhook** in your MuseRank dashboard.
 2. On first connect, MuseRank generates a `whsec_…` signing secret and shows it **once** — copy it immediately into your environment as `MUSERANK_SIGNING_SECRET`.
-3. To rotate (e.g. after a suspected leak), use the **Rotate** action on the same screen. The previous secret stops verifying immediately — keep both in your SDK config during the rotation window.
+3. To rotate (e.g. after a suspected leak), use the **Rotate** action on the same screen. The previous secret stops being used immediately — see **Rotating the secret** above.
 
 If you set `signingSecret` on the SDK side but the destination has no secret configured in MuseRank, every request will fail with `401 Invalid signature`. Either generate one in the dashboard, or remove the `signingSecret` option from the SDK config until you do.
 
@@ -431,15 +482,30 @@ createMuseRankWebhook({
 
 ### Payload Size Limits
 
-The SDK rejects requests larger than **1MB** by default with HTTP `413`.
+The SDK rejects requests larger than **5MB** by default with HTTP `413`.
+MuseRank allows article HTML up to 2,000,000 characters and sends it twice
+(HTML plus Markdown), so payloads for long articles can reach about 4–5MB.
+MuseRank treats `413` as permanent and does not retry, so don't set the
+limit lower than the articles you publish. The `/web` and `/nextjs`
+adapters (and the Express handler when no body parser runs before it) check
+the `Authorization` header before reading the body, so unauthenticated
+requests are rejected without being buffered. Middleware that parses the
+body first (`express.json()`, `rawBodyMiddleware`) reads it before that
+check, so its `limit` is your upper bound.
 
 ```typescript
 createMuseRankWebhook({
   accessToken: process.env.MUSERANK_WEBHOOK_TOKEN!,
-  maxBodySizeBytes: 2 * 1024 * 1024, // 2MB
+  maxBodySizeBytes: 8 * 1024 * 1024, // 8MB
   // Set to 0 to disable payload size enforcement
 });
 ```
+
+Your framework may enforce its own, smaller limit before the SDK runs:
+`express.json()` defaults to **100kb** (set `limit: '5mb'`), and the Next.js
+Pages Router body parser defaults to **1mb** (disable it with
+`bodyParser: false`, which signature verification needs anyway). The
+App Router and `/web` adapters read the body themselves.
 
 ### ⚠️ Important: Raw Body Preservation
 
@@ -453,9 +519,9 @@ import { createRawBodyVerifier, createMuseRankWebhook } from '@muserank/webhook-
 app.post(
   '/api/webhooks/muserank',
   express.json({
-    limit: '2mb',
+    limit: '5mb',
     verify: createRawBodyVerifier({
-      maxBodySizeBytes: 2 * 1024 * 1024, // Optional, defaults to 1MB
+      maxBodySizeBytes: 5 * 1024 * 1024, // Optional, defaults to 5MB
     }),
   }),
   createMuseRankWebhook({
@@ -471,7 +537,7 @@ import { rawBodyMiddleware, createMuseRankWebhook } from '@muserank/webhook-sdk/
 
 app.post(
   '/api/webhooks/muserank',
-  rawBodyMiddleware({ maxBodySizeBytes: 2 * 1024 * 1024 }),
+  rawBodyMiddleware({ maxBodySizeBytes: 5 * 1024 * 1024 }),
   createMuseRankWebhook({
     accessToken: process.env.MUSERANK_WEBHOOK_TOKEN!,
     signingSecret: process.env.MUSERANK_SIGNING_SECRET,
@@ -571,11 +637,11 @@ import type {
 
 1. Go to **Integrations** in your MuseRank dashboard
 2. Click **Connect** on the Webhook card
-3. Enter your webhook endpoint URL (e.g., `https://yourdomain.com/api/webhooks/muserank`)
-4. Generate and copy an access token
+3. Enter your webhook endpoint URL (e.g., `https://yourdomain.com/api/webhooks/muserank`). It must be a public `https` URL, and redirects are not followed.
+4. Enter an access token (at least 10 characters). You choose it; use a long random value and set the same value as `MUSERANK_WEBHOOK_TOKEN` (`accessToken`) on your endpoint.
 5. Select which event types to receive
-6. Click **Connect Webhook**
-7. Use the **Test** button to verify your integration
+6. Click **Connect Webhook**. MuseRank generates a `whsec_…` signing secret and shows it **once**; copy it into `MUSERANK_SIGNING_SECRET` (`signingSecret`).
+7. Use the **Test** button to verify your integration (sends `test.ping`)
 
 ## Examples
 

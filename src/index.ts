@@ -58,11 +58,19 @@ export interface WebhookArticle {
   content_html: string;
   /** Meta description for SEO */
   meta_description: string;
-  /** ISO 8601 timestamp of article creation */
+  /**
+   * ISO 8601 timestamp of when the article was created in MuseRank.
+   * This is NOT the publish time; for `article.published` use
+   * `payload.timestamp` (the dispatch time) if you need one.
+   */
   created_at: string;
-  /** Featured image URL (if any) */
+  /** Featured image URL, or `""` when none is set */
   image_url: string;
-  /** URL-friendly slug */
+  /**
+   * URL-friendly slug, derived from the article's editorial title
+   * (not from `title`, which prefers the SEO title). It changes if the
+   * editorial title changes, so key your records on `id`, not `slug`.
+   */
   slug: string;
   /**
    * Topical tags for the article. MuseRank derives these from the
@@ -130,20 +138,41 @@ export const DEFAULT_TIMESTAMP_TOLERANCE_MS = 5 * 60 * 1000;
 export const CLOCK_SKEW_TOLERANCE_MS = 30_000; // 30 seconds
 
 /**
- * Default max payload size: 1 MB
+ * Default max payload size: 5 MiB.
+ *
+ * MuseRank accepts article HTML up to 2,000,000 characters and every
+ * article payload carries that HTML twice (`content_html` plus the
+ * converted `content_markdown`), so a legitimate payload can reach
+ * roughly 4–5 MB. A smaller default would make MuseRank's long
+ * articles fail with 413, which MuseRank treats as a permanent
+ * failure and does not retry.
+ *
+ * The `/web` and `/nextjs` adapters (and the `/express` handler when it
+ * reads the request stream itself) check the `Authorization` header
+ * before reading the body, so an unauthenticated client cannot make
+ * the SDK buffer this much. Body-parsing middleware that runs first
+ * (`express.json()`, `rawBodyMiddleware`) reads the body before any
+ * check, so give it a deliberate `limit`.
  */
-export const DEFAULT_MAX_BODY_SIZE_BYTES = 1024 * 1024;
+export const DEFAULT_MAX_BODY_SIZE_BYTES = 5 * 1024 * 1024;
 
 /**
- * Default per-handler timeout: 30 seconds.
- *
- * Long-running event handlers block the inbound HTTP response (and
- * therefore MuseRank's outbound `pinnedFetch` connection). 30s is
- * comfortably above the worst-case webhook fan-out we've seen in
- * practice (DB upsert + image re-host) but well below typical edge /
- * Lambda execution caps.
+ * How long MuseRank waits for your endpoint to respond before it
+ * aborts the delivery attempt and schedules a retry.
  */
-export const DEFAULT_HANDLER_TIMEOUT_MS = 30_000;
+export const MUSERANK_DELIVERY_TIMEOUT_MS = 30_000;
+
+/**
+ * Default per-handler timeout: 25 seconds.
+ *
+ * Long-running event handlers block the inbound HTTP response, and
+ * MuseRank aborts each delivery attempt after
+ * {@link MUSERANK_DELIVERY_TIMEOUT_MS} (30s). The default stays below
+ * that so the SDK answers with a 500 (and MuseRank retries cleanly)
+ * before MuseRank gives up on the connection while your handler is
+ * still running.
+ */
+export const DEFAULT_HANDLER_TIMEOUT_MS = 25_000;
 
 /**
  * Per-event context passed to every handler as the third argument.
@@ -207,12 +236,18 @@ export interface WebhookConfig {
    * Optional: Webhook signing secret(s) for HMAC verification.
    * If provided, the X-MuseRank-Signature header will be validated.
    *
-   * Pass an array to support zero-downtime rotation — every secret
-   * in the array is tried in order and the request is accepted as
-   * soon as any one of them matches. After rotating in MuseRank,
-   * keep the previous secret in second position until you're sure
-   * no in-flight requests still use it, then drop it on the next
-   * deploy.
+   * Pass an array to accept more than one secret — every secret in
+   * the array is tried and the request is accepted if any one of
+   * them matches.
+   *
+   * MuseRank signs every delivery attempt (including retries) with
+   * the secret that is current at send time, and **Rotate** in the
+   * dashboard takes effect immediately. Deliveries sent after the
+   * rotation and before your endpoint knows the new secret fail with
+   * 401, and MuseRank does not retry 4xx responses. To keep that
+   * window short, deploy `[newSecret, oldSecret]` right after
+   * rotating (the old entry only covers requests already in flight),
+   * then drop the old secret.
    *
    * Each secret is verified with a sequential async HMAC compute, so
    * the total verification time grows linearly with the array length.
@@ -238,8 +273,10 @@ export interface WebhookConfig {
 
   /**
    * Optional: Maximum webhook body size in bytes.
-   * Requests exceeding this limit are rejected with status 413.
-   * Default: 1MB (1048576 bytes)
+   * Requests exceeding this limit are rejected with status 413, which
+   * MuseRank treats as permanent (no retry).
+   * Default: 5 MiB ({@link DEFAULT_MAX_BODY_SIZE_BYTES}), sized for
+   * MuseRank's largest articles. Lowering it can reject real articles.
    * Set to 0 to disable body size verification.
    */
   maxBodySizeBytes?: number;
@@ -249,13 +286,15 @@ export interface WebhookConfig {
    * handler is allowed to run before its `signal` is aborted and the
    * SDK fails the request.
    *
-   * Default: 30s ({@link DEFAULT_HANDLER_TIMEOUT_MS}). Set to `0` to
-   * disable the timeout entirely (the abort signal will still be
+   * Default: 25s ({@link DEFAULT_HANDLER_TIMEOUT_MS}), below MuseRank's
+   * 30s delivery timeout. Values above 30s let MuseRank abort the
+   * attempt and retry while your handler is still running. Set to `0`
+   * to disable the timeout entirely (the abort signal will still be
    * present on `WebhookContext`, it just never fires).
    *
    * The timer is per-handler-call: an `article.published` event with
    * 3 articles in `data.articles` gets 3 timers, not one combined
-   * 30-second budget.
+   * budget. MuseRank currently sends one article per event.
    */
   handlerTimeoutMs?: number;
 

@@ -14,14 +14,15 @@ const signingSecret = (process.env.MUSERANK_SIGNING_SECRET ?? "")
 
 // `verify` runs while express.json() is reading the body, before
 // parsing — the perfect spot to snapshot the raw bytes so HMAC
-// verification doesn't fight whitespace re-serialization. We cap the
-// body at 2 MB; the SDK separately enforces 1 MB by default and you
-// can tighten either side independently.
+// verification doesn't fight whitespace re-serialization. Both limits
+// are 5 MB to match the SDK default: express.json() defaults to 100kb,
+// and MuseRank sends long articles as HTML plus Markdown, so a smaller
+// limit turns real articles into permanent 413 failures.
 app.use(
   "/api/webhooks/muserank",
   express.json({
-    limit: "2mb",
-    verify: createRawBodyVerifier({ maxBodySizeBytes: 2 * 1024 * 1024 }),
+    limit: "5mb",
+    verify: createRawBodyVerifier({ maxBodySizeBytes: 5 * 1024 * 1024 }),
   }),
   createMuseRankWebhook({
     accessToken: process.env.MUSERANK_WEBHOOK_TOKEN!,

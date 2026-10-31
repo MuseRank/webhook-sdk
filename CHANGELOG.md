@@ -2,9 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [3.0.0] - Unreleased
 
-### Fixed
+Not yet published to npm. Supersedes PR #3 (`feat/webhook-event-id-idempotency`).
+
+### Fixed (aligned with what the MuseRank dispatcher actually sends)
+
+- **Default `maxBodySizeBytes` raised from 1MB to 5MB.** MuseRank accepts
+  article HTML up to 2,000,000 characters and sends it twice (HTML plus
+  Markdown), so long articles produced payloads above 1MB. The SDK answered
+  `413`, which MuseRank treats as permanent, so those articles never arrived.
+- **Adapters check `Authorization` before reading the body.** `/web` and
+  `/nextjs` (App and Pages Router), and the `/express` handler when it reads
+  the stream itself, now reject a missing or wrong bearer token with `401`
+  before buffering, so the larger default does not let unauthenticated
+  clients make the SDK hold 5MB. An unauthenticated oversized request now
+  gets `401` instead of `413`. Body-parsing middleware that runs first
+  (`express.json()`, `rawBodyMiddleware`) is bounded by its own `limit`.
+- **Default `handlerTimeoutMs` lowered from 30s to 25s**, below MuseRank's
+  30s per-attempt delivery timeout (new export
+  `MUSERANK_DELIVERY_TIMEOUT_MS`). With equal values MuseRank could abort
+  the attempt and retry while the handler was still running.
+- **Docs match MuseRank's delivery behaviour**: up to 8 attempts over about
+  an hour (not 3), which statuses are retried, auto-disable after 10
+  consecutive failures, every header MuseRank sends (including
+  `X-MuseRank-Signature-V2` / `X-MuseRank-Timestamp`, which the SDK does not
+  need), how rotation really behaves (immediate, so `401`s in the gap are
+  not retried), that `created_at` is not the publish time, that `slug`
+  comes from the editorial title, and that the access token is user-chosen.
+- **Framework limits documented and examples fixed**: `express.json()`
+  defaults to 100kb, which rejected most articles; every Express example now
+  sets `limit: '5mb'`.
+- **Idempotency examples no longer lose events.** The README and Next.js
+  example committed the `event_id` claim before doing the work, so a failed
+  handler turned MuseRank's retry into a skipped "duplicate". The claim now
+  runs in the same transaction as the work (or is released on failure).
 
 - **Stricter `event_id` / `delivery_id` validation.** The SDK now rejects
   any non-empty string that contains characters outside the printable
@@ -36,8 +68,6 @@ All notable changes to this project will be documented in this file.
   `400 Raw request body is required for signature verification` trap
   by copying the basic example.
 
-## [3.0.0] - 2026-05-28
-
 ### Breaking changes
 
 - **Payload now requires `event_id`.** Every webhook from MuseRank carries
@@ -62,15 +92,14 @@ All notable changes to this project will be documented in this file.
 - **`WebhookContext`**: third argument to every handler. Carries
   `eventId`, `deliveryId`, and an `AbortSignal` that fires when the
   per-handler timeout expires.
-- **`handlerTimeoutMs`**: new config option (default **30s**). Aborts
+- **`handlerTimeoutMs`**: new config option (default **25s**). Aborts
   long-running handlers via the context's `signal` and fails the
   request with `WebhookHandlerTimeoutError` so MuseRank backs off and
   retries instead of holding the connection forever. Set to `0` to
   disable.
-- **Multi-secret rotation**: `signingSecret` now accepts
-  `string | readonly string[]`. Pass the array form during a rotation
-  window so both the old and new secret verify; drop the old one on the
-  next deploy. Iteration runs every candidate even after a match so
+- **Multi-secret verification**: `signingSecret` now accepts
+  `string | readonly string[]`. Deploy `[new, old]` right after rotating
+  in MuseRank; drop the old one on the next deploy. Iteration runs every candidate even after a match so
   the loop runtime doesn't leak how many secrets are configured.
 - **`onError` response override**: `onError` may now return
   `{ statusCode, success?, message? }` to override the default 500
